@@ -1,0 +1,274 @@
+# lit-review-agent
+
+> LangGraph agent that retrieves, clusters and synthesizes academic papers into cited literature reviews with gap analysis.
+
+给定一个研究主题，自动完成：**扩词检索多源学术文献 → 去重排序 → 解析抽取 → 主题聚类 → 分主题撰写带引用段落 → 评审找空白 → 产出结构化综述（含参考文献表与 BibTeX）**。
+
+核心不是「自由聊天」，而是 **检索召回质量 + 证据可追溯 + 结构化成稿**。
+
+---
+
+## 快速开始
+
+```bash
+# 1. 安装
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e .
+
+# 2. 配置
+cp .env.example .env      # 填入 DEEPSEEK_API_KEY 与 CONTACT_EMAIL
+
+# 3. 先离线试跑，确认检索链路通
+python -m src.main "retrieval augmented generation" --dry-run
+
+# 4. 正式生成
+python -m src.main "retrieval augmented generation"
+```
+
+产物默认写到 `output/`：
+
+| 文件 | 内容 |
+|------|------|
+| `*_review.md` | 综述正文（内联 `[n]` 引用 + 参考文献表 + 生成过程附录） |
+| `*_references.bib` | BibTeX，可直接进 LaTeX |
+| `*_papers.json` | 完整文献池元数据（含得分、引用编号），便于人工复核 |
+
+---
+
+## 工作流
+
+```mermaid
+flowchart TD
+    START([START]) --> QE[QueryExpander 扩词<br/>生成多组检索式]
+    QE --> R[Retriever 检索<br/>arXiv / OpenAlex / S2]
+    R -->|数量不足| R
+    R --> RK[Ranker 去重排序<br/>相关性+引用+新颖度]
+    RK --> EX[Extractor 解析<br/>抽取方法/结论/数据/指标]
+    EX --> CL[Clusterer 聚类<br/>embedding + KMeans]
+    CL --> SW[SectionWriter 撰写<br/>分主题带引用段落]
+    SW --> CR[Critic 评审<br/>覆盖度/矛盾检查]
+    CR -->|覆盖不足补文献| QE
+    CR --> GA[GapAnalyzer 找空白]
+    GA --> SY[Synthesizer 汇总<br/>成稿+参考文献+BibTeX]
+    SY --> H[Human 审核 可选]
+    H --> END([END])
+```
+
+**双环路**（都有硬性轮次上限，杜绝死循环）：
+
+- **内环** `Retriever ⟲`：文献池未达 `TARGET_PAPER_COUNT` 时，放大每条检索式的返回上限重试，最多 `MAX_RETRIEVAL_ROUNDS` 轮。
+- **外环** `Critic → QueryExpander`：评审判定覆盖不足时，带着**具体缺口**生成新检索式补文献——这是综述最容易漏掉关键流派的地方。最多打回 `MAX_CRITIC_ROUNDS` 次。
+
+用 `python -m src.main --print-graph` 可打印实际编译出的状态机拓扑。
+
+### 各节点职责
+
+| 节点 | 职责 |
+|------|------|
+| `QueryExpander` | 主题 → 5-8 条英文检索式（同义词/方法名/数据集/评测/交叉领域）；打回时只生成补缺口的新检索式 |
+| `Retriever` | 并发打多源 API（源间并行、源内串行以尊重限流），与已有池合并 |
+| `Ranker` | 三级去重 → OpenAlex 补引用数 → 综合打分排序 → 对 Top-N 拉全文 |
+| `Extractor` | 分批（5 篇/次）抽取「方法/结论/数据集/指标」，绑定 `paper_id` |
+| `Clusterer` | embedding + KMeans 分簇 → LLM 起小节标题 → 分配引用编号 |
+| `SectionWriter` | 每簇生成 300-600 字带 `[n]` 内联引用的段落 |
+| `Critic` | 检查覆盖度/矛盾处理/证据密度/结构，判 `pass` 或 `need_more` |
+| `GapAnalyzer` | 结合年份分布与簇分布，识别研究空白与演进趋势 |
+| `Synthesizer` | 摘要+引言+小节+空白+结论+参考文献+BibTeX，落盘 |
+| `Human` | 可选挂起点，人工改完 state 再续跑 |
+
+---
+
+## 设计要点
+
+### 1. 跨源去重与信息互补
+
+同一篇论文常同时出现在 arXiv（有 PDF 直链，无引用数）和 OpenAlex（有引用数，可能无 PDF）。三级去重 **DOI → arXiv ID → 标题指纹**，命中后按「谁的信息更全用谁」合并字段，最终一条记录同时拥有 PDF 直链 + 被引量 + 完整摘要。
+
+### 2. 排序信号
+
+```
+score = 0.45 × 相关性(TF-IDF 余弦)
+      + 0.28 × 引用数(log 归一化)
+      + 0.17 × 新颖度(年份归一化)
+      + 0.10 × 检索式覆盖度(被几条检索式同时命中)
+```
+
+覆盖度这一项的作用：被多条不同角度检索式同时命中的论文，通常是该领域的枢纽工作。
+
+### 3. 引用防幻觉
+
+综述最致命的失败是编造引用。三道防线：
+
+1. Prompt 里显式给出「可用引用编号」白名单，并声明不得使用列表外编号；
+2. 生成后用 `_strip_invalid_citations()` 正则清洗，**物理删除**白名单外的 `[n]`；
+3. 参考文献表只收录 `citation_map` 里的论文，编号严格连续。
+
+测试 `test_full_graph_end_to_end` 会校验正文中每个 `[n]` 都能在参考文献表中找到。
+
+### 4. 全文按需下载
+
+不必全下 PDF：综述覆盖数十上百篇，真正需读全文的只是高相关/高引用那批（`TOP_N_FULLTEXT`，默认 8 篇），其余用摘要。全文会做 **头尾保留式压缩**（开头的摘要+引言+方法、结尾的实验结论），丢弃中间的公式推导，显著省 token。
+
+### 5. 下载礼貌与版权合规
+
+- arXiv 请求间隔 ≥ 3s；OpenAlex 带 `mailto` 进 polite pool；S2 无 key 时 3.2s/次；
+- UA 统一为 `lit-review-agent/0.1 (mailto:你的邮箱)`，学术 API 靠这个识别善意机器人；
+- 429 自动指数退避；单源失败不中断全局；
+- **只下 OA / 作者自存档副本**，明确的出版社付费墙域名直接跳过；
+- 每个落盘 PDF 附带 `.json` sidecar 记录来源 URL 与 license。
+
+### 6. 零配置也能跑
+
+- 未装 `sentence-transformers` → 聚类自动降级为 TF-IDF + TruncatedSVD（纯 sklearn，无需下载模型）；
+- 未指定簇数 → 用轮廓系数在 `[2, 8]` 区间自动选 k；
+- LLM 抽取失败 → 用摘要首段兜底，保证每篇文献都有可用证据；
+- JSON 解析失败 → 剥离代码围栏 / 截取平衡括号 / 修复尾随逗号，再失败则换 prompt 重试一次。
+
+---
+
+## 配置
+
+全部配置见 `.env.example`。常用项：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `LLM_PROVIDER` | `deepseek` | `deepseek` / `openai` / `ollama` / `stub` |
+| `CONTACT_EMAIL` | — | **建议填真实邮箱**，学术 API 据此给更高配额 |
+| `ENABLED_SOURCES` | `arxiv,openalex` | 可加 `semantic_scholar` |
+| `TARGET_PAPER_COUNT` | `40` | 文献池目标规模，不足触发内环 |
+| `TOP_N_FULLTEXT` | `8` | 下载全文的篇数，`0` 或 `ENABLE_FULLTEXT=false` 为纯摘要模式 |
+| `N_CLUSTERS` | `0` | 主题簇数，`0` = 自动推断 |
+| `MAX_CRITIC_ROUNDS` | `2` | 外环允许的打回次数 |
+| `REPORT_LANGUAGE` | `zh` | `zh` / `en` |
+| `CHECKPOINT_BACKEND` | `memory` | 改 `sqlite` 可断点续跑（需 `pip install -e ".[persist]"`） |
+
+### 换 LLM
+
+```bash
+python -m src.main "topic" --provider openai        # 或 ollama
+```
+
+Ollama 走本地 OpenAI 兼容端点，无需 key，但不启用 JSON mode（靠容错解析兜底）。
+
+---
+
+## CLI
+
+```
+python -m src.main <主题> [选项]
+
+检索：
+  --sources arxiv,openalex      启用的检索源
+  -n, --target 40               文献池目标规模
+  --per-query 25                单条检索式单源最大返回条数
+  --min-year 2020               只保留该年份及之后的文献
+  --top-fulltext 8              下载解析全文的 Top-N 篇数
+  --no-fulltext                 纯摘要模式
+
+生成：
+  --provider deepseek|openai|ollama|stub
+  --clusters 5                  主题簇数，0=自动
+  --lang zh|en                  综述正文语言
+  --critic-rounds 2             Critic 打回次数上限
+  --human                       定稿前挂起等待人工审核
+
+其他：
+  -o, --output output/          输出目录
+  --thread-id xxx               检查点线程 ID，同名可断点续跑
+  --dry-run                     离线试跑：stub LLM + 不下载 PDF
+  --print-graph                 打印状态机结构
+  -v, --verbose                 DEBUG 日志
+```
+
+### 人工介入
+
+```bash
+python -m src.main "topic" --human --thread-id my-run
+```
+
+图会在 `human_review` 前挂起。用相同 `thread-id` 再次调用即可续跑定稿；配合 `CHECKPOINT_BACKEND=sqlite` 可跨进程续跑。
+
+程序化使用：
+
+```python
+from src.agent.graph import build_graph
+from src.agent.state import initial_state
+
+graph = build_graph(with_human=True)
+config = {"configurable": {"thread_id": "run-1"}, "recursion_limit": 80}
+
+state = graph.invoke(initial_state("your topic"), config)
+# ... 检查/修改 state["sections"] ...
+graph.update_state(config, {"sections": edited_sections})
+final = graph.invoke(None, config)
+```
+
+---
+
+## 项目结构
+
+```
+lit-review-agent/
+├── src/
+│   ├── agent/
+│   │   ├── graph.py        # StateGraph 组装、条件路由、run_review 入口
+│   │   ├── state.py        # AgentState / Paper / Evidence
+│   │   ├── nodes.py        # 10 个节点实现
+│   │   ├── tools.py        # 多源检索、去重、排序、全文获取
+│   │   ├── prompts.py      # 各节点提示词
+│   │   └── llm.py          # 统一 LLM 调用 + JSON 容错 + stub 后端
+│   ├── ingest/
+│   │   ├── base.py         # Paper 结构、限流器、礼貌 HTTP
+│   │   ├── arxiv_client.py
+│   │   ├── openalex.py     # 含摘要倒排索引还原、引用数补全
+│   │   ├── semantic_scholar.py
+│   │   ├── unpaywall.py    # 按 DOI 兜底找 OA
+│   │   ├── downloader.py   # OA 解析 + PDF 下载 + license sidecar
+│   │   └── pdf_parser.py   # pypdf 抽取 + 头尾压缩
+│   ├── cluster/theme_cluster.py
+│   ├── report/bibtex.py
+│   ├── config.py
+│   └── main.py
+├── tests/                  # 54 个测试，默认不联网
+├── pyproject.toml
+└── .env.example
+```
+
+---
+
+## 测试
+
+```bash
+pip install -e ".[dev]"
+pytest -m "not network"     # 54 个离线测试，约 5s
+pytest -m network           # 2 个联网测试，真打 arXiv / OpenAlex
+```
+
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、限流、聚类可分性与编号、BibTeX 条目类型与转义、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、人工介入挂起与续跑。
+
+---
+
+## 可选依赖
+
+```bash
+pip install -e ".[embed]"     # sentence-transformers，语义聚类效果更好
+pip install -e ".[persist]"   # SQLite 检查点，断点续跑
+pip install grandalf          # --print-graph 显示 ASCII 图
+```
+
+---
+
+## 已知限制
+
+- 中文主题也能跑，但检索式是英文的（学术 API 中文覆盖差），中文文献需另接 CNKI/万方类数据源；
+- `Extractor` 默认只处理排序后前 60 篇，超大文献池需调 `MAX_EXTRACT_PAPERS`；
+- TF-IDF 降级模式下轮廓系数普遍偏低，簇边界不如语义 embedding 清晰，建议装 `[embed]`；
+- 引用编号在 Critic 打回重跑后会重新分配，不保证跨轮次稳定。
+
+## 路线
+
+- [x] MVP：arXiv + OpenAlex，摘要模式，扩词/聚类/成稿闭环
+- [x] 全文 PDF 解析、Critic 外环、BibTeX、Human-in-the-loop
+- [ ] 向量库持久化文献池（chromadb / faiss），跨主题复用
+- [ ] LaTeX 模板输出
+- [ ] LangSmith 轨迹面板与成本统计
