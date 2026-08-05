@@ -16,6 +16,8 @@ from src.agent import prompts as P
 from src.agent.llm import chat, chat_json
 from src.agent.state import AgentState, Evidence
 from src.agent.tools import (
+    apply_relevance_gate,
+    compute_relevance,
     dedup_papers,
     enrich_topn_fulltext,
     multi_source_search,
@@ -134,7 +136,7 @@ def retriever(state: AgentState) -> dict:
 # 3. Ranker
 # ==========================================================================
 def ranker(state: AgentState) -> dict:
-    """去重后排序 + 补引用数 + 对 Top-N 拉全文。"""
+    """去重后排序 + 相关性闸门 + 补引用数 + 对 Top-N 拉全文。"""
     settings = get_settings()
     papers = list(state.get("papers") or [])
     queries = state.get("queries") or []
@@ -143,16 +145,36 @@ def ranker(state: AgentState) -> dict:
     if "openalex" in settings.enabled_sources:
         enrich_citations(papers, limit=30)
 
-    ranked = rank_papers(papers, state["topic"], queries, settings)[:POOL_HARD_CAP]
+    # --- 相关性闸门（P0-1）---
+    relevance = compute_relevance(papers, state["topic"], queries)
+    kept, dropped = apply_relevance_gate(
+        papers, relevance, settings.relevance_gate, settings.min_pool_after_gate
+    )
+    gate_stats = {
+        "total": len(papers),
+        "kept": len(kept),
+        "dropped": len(dropped),
+        "threshold": settings.relevance_gate,
+        "dropped_titles": dropped[:25],
+    }
+
+    # 排序用闸门幸存者；relevance 已对齐 kept 顺序，避免重复计算
+    score_map = {p["paper_id"]: relevance[i] for i, p in enumerate(papers)}
+    kept_relevance = [score_map[p["paper_id"]] for p in kept]
+    ranked = rank_papers(kept, state["topic"], queries, settings, relevance=kept_relevance)[
+        :POOL_HARD_CAP
+    ]
     n_full = enrich_topn_fulltext(ranked, settings)
 
     top_preview = " | ".join(f"{p['title'][:38]}({p.get('year')})" for p in ranked[:3])
     return {
         "papers": ranked,
+        "relevance_gate": gate_stats,
         "logs": [
             _log(
-                f"Ranker: {len(ranked)} 篇入池，年份 {year_range(ranked)}，"
-                f"全文解析 {n_full} 篇；Top3: {top_preview}"
+                f"Ranker: 相关性闸门移除 {gate_stats['dropped']} 篇偏离主题"
+                f"（阈值 {gate_stats['threshold']}），保留 {gate_stats['kept']} 篇入池；"
+                f"年份 {year_range(ranked)}，全文解析 {n_full} 篇；Top3: {top_preview}"
             )
         ],
     }
@@ -528,8 +550,12 @@ def synthesizer(state: AgentState) -> dict:
     paths["papers"].write_text(
         json.dumps(
             [
-                {k: v for k, v in p.items() if k != "fulltext"}
-                | {"citation_index": citation_map.get(p["paper_id"])}
+                {
+                    **{k: v for k, v in p.items() if k != "fulltext"},
+                    "has_fulltext": bool(p.get("has_fulltext")),
+                    "fulltext_chars": int(p.get("fulltext_chars") or 0),
+                    "citation_index": citation_map.get(p["paper_id"]),
+                }
                 for p in papers
             ],
             ensure_ascii=False,
@@ -576,15 +602,21 @@ def _assemble_markdown(
     critic_report = state.get("critic") or {}
 
     parts: List[str] = []
+    cited_papers_all = [p for p in papers if p["paper_id"] in citation_map]
+    n_full = sum(1 for p in cited_papers_all if p.get("has_fulltext"))
+    if n_full:
+        fulltext_note = f"已获取 {n_full} 篇 OA 全文（其余基于摘要）"
+    else:
+        fulltext_note = "基于摘要撰写（未获取到可用 OA 全文）"
     parts.append(f"# {state['topic']} —— 文献综述\n")
     parts.append(
         "> 本文由 **lit-review-agent** 自动生成。\n>\n"
         f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} | "
         f"检索源：{', '.join(settings.enabled_sources)} | "
         f"候选文献 {len(papers)} 篇，引用 {len(citation_map)} 篇 | "
-        f"年份跨度 {year_range([p for p in papers if p['paper_id'] in citation_map])}\n>\n"
+        f"年份跨度 {year_range(cited_papers_all)}\n>\n"
         "> 所有论断均带内联引用 `[n]`，编号对应文末参考文献表；"
-        "全文仅使用开放获取（OA）副本。\n"
+        f"{fulltext_note}。\n"
     )
 
     parts.append("## 摘要\n\n" + (abstract or "（生成失败）"))
@@ -626,6 +658,20 @@ def _assemble_markdown(
     if critic_report.get("contradictions"):
         appendix.append("- 已识别的结论冲突：\n" + "\n".join(
             f"  - {c}" for c in critic_report["contradictions"]))
+
+    # A.5 相关性闸门（P0-1）：让检索质量可审计
+    gate = state.get("relevance_gate") or {}
+    if gate:
+        appendix.append("\n### A.5 相关性闸门\n")
+        appendix.append(
+            f"- 阈值 `{gate.get('threshold')}`：候选 {gate.get('total')} 篇 → "
+            f"移除 **{gate.get('dropped')}** 篇偏离主题，保留 {gate.get('kept')} 篇入池"
+        )
+        dropped_titles = gate.get("dropped_titles") or []
+        if dropped_titles:
+            appendix.append("移除的论文（主题相关性不足）：\n" + "\n".join(
+                f"  - {t}" for t in dropped_titles[:15]) or "（无）")
+
     appendix.append("\n### A.4 执行轨迹\n")
     appendix.append("```\n" + "\n".join(state.get("logs") or []) + "\n```")
     parts.append("\n".join(appendix))

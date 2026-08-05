@@ -86,6 +86,26 @@ class Settings:
     n_clusters: int = field(default_factory=lambda: _env_int("N_CLUSTERS", 0))
     min_year: int = field(default_factory=lambda: _env_int("MIN_YEAR", 0))
 
+    # ---- 相关性闸门与排序（P0-1）----
+    relevance_gate: float = field(
+        default_factory=lambda: _env_float("RELEVANCE_GATE", 0.10)
+    )
+    relevance_weight: float = field(
+        default_factory=lambda: _env_float("RELEVANCE_WEIGHT", 0.55)
+    )
+    citation_weight: float = field(
+        default_factory=lambda: _env_float("CITATION_WEIGHT", 0.20)
+    )
+    recency_weight: float = field(
+        default_factory=lambda: _env_float("RECENCY_WEIGHT", 0.15)
+    )
+    coverage_weight: float = field(
+        default_factory=lambda: _env_float("COVERAGE_WEIGHT", 0.10)
+    )
+    min_pool_after_gate: int = field(
+        default_factory=lambda: _env_int("MIN_POOL_AFTER_GATE", 20)
+    )
+
     # ---- 输出 ----
     output_dir: Path = field(default_factory=lambda: PROJECT_ROOT / _env("OUTPUT_DIR", "output"))
     cache_dir: Path = field(default_factory=lambda: PROJECT_ROOT / _env("CACHE_DIR", ".cache"))

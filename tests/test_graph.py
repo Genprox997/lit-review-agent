@@ -22,6 +22,7 @@ def stub_env(monkeypatch, tmp_path):
     """强制 stub LLM + 关闭全文下载 + 输出到临时目录。"""
     monkeypatch.setenv("LLM_PROVIDER", "stub")
     monkeypatch.setenv("ENABLE_FULLTEXT", "false")
+    monkeypatch.setenv("RELEVANCE_GATE", "0")   # 离线桩测试关闭相关性闸门（闸门逻辑见 test_p0.py）
     monkeypatch.setenv("CONTACT_EMAIL", "test@example.com")
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
     monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))

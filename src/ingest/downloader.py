@@ -51,6 +51,13 @@ def _is_paywalled(url: str) -> bool:
     return any(host in low for host in _PAYWALL_HOSTS)
 
 
+def oa_available(paper: Paper) -> bool:
+    """该文献是否有可能获取 OA 全文：已有直链，或可用 DOI 经 Unpaywall 解析。"""
+    if paper.get("pdf_url") and not _is_paywalled(paper["pdf_url"]):
+        return True
+    return bool(paper.get("doi"))
+
+
 def _safe_filename(paper_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", paper_id)[:120] + ".pdf"
 
@@ -122,6 +129,8 @@ def fetch_fulltexts(papers: List[Paper], max_workers: int = 3) -> int:
         if not text or len(text) < 500:
             return False
         paper["fulltext"] = condense_fulltext(text)
+        paper["has_fulltext"] = True
+        paper["fulltext_chars"] = len(paper["fulltext"])
         return True
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

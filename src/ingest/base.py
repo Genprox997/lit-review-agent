@@ -32,6 +32,9 @@ class Paper(TypedDict, total=False):
     fulltext: Optional[str]
     score: float           # Ranker 打分
     matched_queries: List[str]
+    relevance: float       # 与主题的相关性（P0-1 闸门）
+    has_fulltext: bool     # 是否成功获取 OA 全文（P0-2）
+    fulltext_chars: int    # 全文字符数
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +118,11 @@ def http_get(
 # --------------------------------------------------------------------------
 _WS = re.compile(r"\s+")
 
+# 合法 DOI 形态：10.<注册码>/<非空非空白后缀>。
+# 注册码长度在真实 DOI 中多为 4~9 位，但 1 位亦属合法语法，故不过度收紧，
+# 仅拦截明显非法的（缺 10. 前缀、含空白、后缀为空）。
+_DOI_RE = re.compile(r"^10\.\d{1,9}/[^\s]+$")
+
 
 def clean_text(text: Optional[str]) -> str:
     if not text:
@@ -123,13 +131,22 @@ def clean_text(text: Optional[str]) -> str:
 
 
 def normalize_doi(doi: Optional[str]) -> Optional[str]:
-    """去掉 https://doi.org/ 前缀并小写化。"""
+    """规范化并校验 DOI。
+
+    - 去掉 https://doi.org/、doi: 等前缀，小写化；
+    - 用正则校验 `10.<注册码>/<后缀>` 形态，明显非法的直接丢弃（返回 None），
+      避免把畸形 DOI 写进 BibTeX / 参考文献表（P0-3）。
+    """
     if not doi:
         return None
     d = str(doi).strip().lower()
-    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi.org/", "doi:"):
         if d.startswith(prefix):
             d = d[len(prefix):]
+    d = d.strip().rstrip(".").strip()
+    if not _DOI_RE.match(d):
+        logger.debug("丢弃非法 DOI: %r", doi)
+        return None
     return d or None
 
 
@@ -160,5 +177,8 @@ def make_paper(**kwargs) -> Paper:
         "fulltext": None,
         "score": 0.0,
         "matched_queries": kwargs.get("matched_queries") or [],
+        "relevance": 0.0,
+        "has_fulltext": False,
+        "fulltext_chars": 0,
     }
     return paper

@@ -84,14 +84,20 @@ flowchart TD
 
 同一篇论文常同时出现在 arXiv（有 PDF 直链，无引用数）和 OpenAlex（有引用数，可能无 PDF）。三级去重 **DOI → arXiv ID → 标题指纹**，命中后按「谁的信息更全用谁」合并字段，最终一条记录同时拥有 PDF 直链 + 被引量 + 完整摘要。
 
-### 2. 排序信号
+### 2. 排序信号与相关性闸门
+
+排序用**相关性主导**的加权分（权重见 `.env` 的 `RELEVANCE_WEIGHT` 等）：
 
 ```
-score = 0.45 × 相关性(TF-IDF 余弦)
-      + 0.28 × 引用数(log 归一化)
-      + 0.17 × 新颖度(年份归一化)
+score = 0.55 × 相关性(TF-IDF 余弦)
+      + 0.20 × 引用数(log 归一化)
+      + 0.15 × 新颖度(年份归一化)
       + 0.10 × 检索式覆盖度(被几条检索式同时命中)
 ```
+
+相关性占主导，是为了**不让高被引但跑题的论文绑架排序**（综述最常见的质量雷：像 Pascal VOC Challenge 这类被引近 2 万的跨主题论文混进候选池）。
+
+**相关性闸门（P0-1）**：排序前先用 TF-IDF 余弦相似度算每篇与主题的相关性，低于 `RELEVANCE_GATE`（默认 0.10）的直接剔除出候选池，从源头阻止跑题文献进入聚类与撰写。闸门有自适应保底——若剔除过多导致文献池塌缩（< `MIN_POOL_AFTER_GATE`，默认 20），则按相关性降序保底保留前 N 篇。被剔除的论文标题记录在成稿附录 A.5，方便人工审计。
 
 覆盖度这一项的作用：被多条不同角度检索式同时命中的论文，通常是该领域的枢纽工作。
 
@@ -107,7 +113,12 @@ score = 0.45 × 相关性(TF-IDF 余弦)
 
 ### 4. 全文按需下载
 
-不必全下 PDF：综述覆盖数十上百篇，真正需读全文的只是高相关/高引用那批（`TOP_N_FULLTEXT`，默认 8 篇），其余用摘要。全文会做 **头尾保留式压缩**（开头的摘要+引言+方法、结尾的实验结论），丢弃中间的公式推导，显著省 token。
+不必全下 PDF：综述覆盖数十上百篇，真正需读全文的只是高相关那批（`TOP_N_FULLTEXT`，默认 8 篇），其余用摘要。全文会做 **头尾保留式压缩**（开头的摘要+引言+方法、结尾的实验结论），丢弃中间的公式推导，显著省 token。
+
+全文抓取做了两处工程处理（P0-2）：
+
+- **优先选 OA 可用文献**：从排序后的候选里优先挑「有 OA PDF 直链 / 可用 DOI 经 Unpaywall 解析」的论文下载，避免旧逻辑按总分取 Top-N 时总选中付费墙期刊论文（无 OA 副本），导致「全文解析 0 篇」；
+- **诚实落盘**：`*_papers.json` 写入 `has_fulltext` 与 `fulltext_chars` 标记（不塞原始全文，避免文件膨胀），报告头据实声明「已获取 N 篇 OA 全文（其余基于摘要）」或「基于摘要撰写」。
 
 ### 5. 下载礼貌与版权合规
 
@@ -124,6 +135,11 @@ score = 0.45 × 相关性(TF-IDF 余弦)
 - LLM 抽取失败 → 用摘要首段兜底，保证每篇文献都有可用证据；
 - JSON 解析失败 → 剥离代码围栏 / 截取平衡括号 / 修复尾随逗号，再失败则换 prompt 重试一次。
 
+### 7. 元数据清洗（P0-3）
+
+- DOI 经正则校验，明显非法的（缺 `10.` 前缀、含空白、后缀为空）直接丢弃，避免畸形 DOI 写进 BibTeX；
+- 检索层常把「arXiv 预印本」与正式期刊 DOI 并存，据 **DOI 前缀 → 期刊名** 映射（如 `10.1364/AO`→Applied Optics、`10.1109`→IEEE、`10.1038`→Nature）在输出时还原真实 venue，纠正「arXiv preprint 配 Optics Express DOI」类错位，同时把条目类型从 `misc` 升级为 `article`/`inproceedings`。
+
 ---
 
 ## 配置
@@ -139,6 +155,8 @@ score = 0.45 × 相关性(TF-IDF 余弦)
 | `TOP_N_FULLTEXT` | `8` | 下载全文的篇数，`0` 或 `ENABLE_FULLTEXT=false` 为纯摘要模式 |
 | `N_CLUSTERS` | `0` | 主题簇数，`0` = 自动推断 |
 | `MAX_CRITIC_ROUNDS` | `2` | 外环允许的打回次数 |
+| `RELEVANCE_GATE` | `0.10` | 相关性闸门阈值，低于此分的论文剔除出候选池；`0` 关闭 |
+| `MIN_POOL_AFTER_GATE` | `20` | 闸门保底：至少保留这么多篇，防止文献池塌缩 |
 | `REPORT_LANGUAGE` | `zh` | `zh` / `en` |
 | `CHECKPOINT_BACKEND` | `memory` | 改 `sqlite` 可断点续跑（需 `pip install -e ".[persist]"`） |
 
@@ -175,7 +193,7 @@ python -m src.main <主题> [选项]
 其他：
   -o, --output output/          输出目录
   --thread-id xxx               检查点线程 ID，同名可断点续跑
-  --dry-run                     离线试跑：stub LLM + 不下载 PDF
+  --dry-run                     离线试跑：stub LLM + 不下载 PDF（仅验证流程）
   --print-graph                 打印状态机结构
   -v, --verbose                 DEBUG 日志
 ```
@@ -229,7 +247,7 @@ lit-review-agent/
 │   ├── report/bibtex.py
 │   ├── config.py
 │   └── main.py
-├── tests/                  # 54 个测试，默认不联网
+├── tests/                  # 61 个测试，默认不联网
 ├── pyproject.toml
 └── .env.example
 ```
@@ -240,11 +258,11 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"
-pytest -m "not network"     # 54 个离线测试，约 5s
+pytest -m "not network"     # 61 个离线测试，约 5s
 pytest -m network           # 2 个联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、限流、聚类可分性与编号、BibTeX 条目类型与转义、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、人工介入挂起与续跑。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、聚类可分性与编号、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、人工介入挂起与续跑。
 
 ---
 
@@ -263,12 +281,15 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - 中文主题也能跑，但检索式是英文的（学术 API 中文覆盖差），中文文献需另接 CNKI/万方类数据源；
 - `Extractor` 默认只处理排序后前 60 篇，超大文献池需调 `MAX_EXTRACT_PAPERS`；
 - TF-IDF 降级模式下轮廓系数普遍偏低，簇边界不如语义 embedding 清晰，建议装 `[embed]`；
-- 引用编号在 Critic 打回重跑后会重新分配，不保证跨轮次稳定。
+- 引用编号在 Critic 打回重跑后会重新分配，不保证跨轮次稳定；
+- **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
+- 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若启用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
 ## 路线
 
 - [x] MVP：arXiv + OpenAlex，摘要模式，扩词/聚类/成稿闭环
 - [x] 全文 PDF 解析、Critic 外环、BibTeX、Human-in-the-loop
+- [x] P0 质量改进：相关性闸门 + 混合排序、全文真正落地、元数据清洗
 - [ ] 向量库持久化文献池（chromadb / faiss），跨主题复用
 - [ ] LaTeX 模板输出
 - [ ] LangSmith 轨迹面板与成本统计

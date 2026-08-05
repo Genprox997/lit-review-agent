@@ -31,6 +31,9 @@ class Paper(TypedDict, total=False):
     fulltext: Optional[str]
     score: float
     matched_queries: List[str]
+    relevance: float                  # 与主题的相关性（P0-1 闸门使用，0-1）
+    has_fulltext: bool                # 是否成功获取 OA 全文（P0-2）
+    fulltext_chars: int               # 全文字符数（持久化用）
 
 
 class Evidence(TypedDict, total=False):
@@ -69,6 +72,7 @@ class AgentState(TypedDict, total=False):
     clusters: List[Dict[str, Any]]              # [{cluster_id,label,keywords,paper_ids,size}]
     sections: Dict[str, str]                    # 主题标题 -> 带引用的段落（有序）
     citation_map: Dict[str, int]                # paper_id -> 引用编号 [n]
+    relevance_gate: Dict[str, Any]              # P0-1：闸门统计 {total,kept,dropped,threshold,dropped_titles}
     critic: CriticReport
     gaps: List[str]
     trends: List[str]
@@ -96,6 +100,7 @@ def initial_state(topic: str, constraints: str = "") -> AgentState:
         "clusters": [],
         "sections": {},
         "citation_map": {},
+        "relevance_gate": {},
         "critic": {},
         "gaps": [],
         "trends": [],

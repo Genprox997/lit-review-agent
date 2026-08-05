@@ -18,6 +18,56 @@ _BIB_ESCAPE = {
     "^": r"\textasciicircum{}",
 }
 
+# DOI 前缀 → 出版方 / 期刊（P0-3：用于纠正 venue 错位）。
+# 例：检索层常把「arXiv 预印本」与正式期刊 DOI 并存，需据 DOI 还原真实期刊名。
+_PUBLISHER_BY_DOI_PREFIX = {
+    "10.1364/ao": "Applied Optics",
+    "10.1364/oe": "Optics Express",
+    "10.1364/ol": "Optics Letters",
+    "10.1364/boe": "Biomedical Optics Express",
+    "10.1364": "Optics (OSA)",
+    "10.1109": "IEEE",
+    "10.1038": "Nature",
+    "10.1016": "Elsevier",
+    "10.1007": "Springer",
+    "10.1145": "ACM",
+    "10.1088": "IOP Publishing",
+    "10.1117": "SPIE",
+    "10.1115": "ASME",
+    "10.3390": "MDPI",
+    "10.1093": "Oxford University Press",
+    "10.1080": "Taylor & Francis",
+    "10.1002": "Wiley",
+    "10.1186": "BMC",
+    "10.1177": "SAGE",
+    "10.1109": "IEEE",
+}
+
+
+def _journal_from_doi(doi: str | None) -> str | None:
+    """据 DOI 前缀推断期刊 / 出版方名（仅覆盖常见前缀）。"""
+    if not doi:
+        return None
+    low = str(doi).lower()
+    for pref, name in _PUBLISHER_BY_DOI_PREFIX.items():
+        if low.startswith(pref):
+            return name
+    return None
+
+
+def _effective_venue(paper: dict) -> str:
+    """返回用于展示 / 条目类型的期刊名。
+
+    若 venue 是预印本占位（arXiv / preprint）但 DOI 指向正式期刊，
+    用期刊名覆盖，纠正「arXiv preprint 配 Optics Express DOI」类错位（P0-3）。
+    """
+    venue = (paper.get("venue") or "").strip()
+    journal = _journal_from_doi(paper.get("doi"))
+    if journal and (not venue or "arxiv" in venue.lower()
+                    or venue.lower() in {"preprint", "arxiv preprint"}):
+        return journal
+    return venue
+
 
 def _escape(text: str) -> str:
     if not text:
@@ -58,8 +108,10 @@ def make_cite_key(paper: dict, used: set) -> str:
 
 def _entry_type(paper: dict) -> str:
     source = paper.get("source", "")
-    venue = (paper.get("venue") or "").lower()
-    if source == "arxiv" or "arxiv" in venue or "preprint" in venue:
+    venue = _effective_venue(paper).lower()
+    # 预印本占位（且未携带正式期刊 DOI）→ 仍记为 misc
+    is_preprint = source == "arxiv" or "arxiv" in venue or "preprint" in venue
+    if is_preprint and not _journal_from_doi(paper.get("doi")):
         return "misc"
     if any(k in venue for k in ("conference", "proceedings", "workshop", "symposium")):
         return "inproceedings"
@@ -74,7 +126,7 @@ def to_bibtex_entry(paper: dict, key: str) -> str:
         ("year", str(paper.get("year") or "")),
     ]
 
-    venue = paper.get("venue") or ""
+    venue = _effective_venue(paper)
     if etype == "inproceedings":
         fields.append(("booktitle", _escape(venue)))
     elif etype == "article" and venue:
@@ -139,7 +191,7 @@ def build_reference_list(
         authors = format_authors_inline(paper.get("authors") or [])
         year = paper.get("year") or "n.d."
         title = paper.get("title") or "(untitled)"
-        venue = paper.get("venue") or ""
+        venue = _effective_venue(paper)
         bits = [f"**[{idx}]** {authors} ({year}). *{title}*."]
         if venue:
             bits.append(f"{venue}.")
