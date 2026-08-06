@@ -58,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     g3 = p.add_argument_group("其他")
     g3.add_argument("-o", "--output", help="输出目录（默认 output/）")
     g3.add_argument("--thread-id", default=None, help="检查点线程 ID，同名可断点续跑")
+    g3.add_argument("--resume", action="store_true",
+                    help="续跑被 --human 挂起的 thread（需配合 --thread-id）")
+    g3.add_argument("--feedback", default=None,
+                    help="续跑时的人工审核意见（可省略，默认 approve 通过）")
     g3.add_argument("--dry-run", action="store_true",
                     help="离线试跑：不调 LLM（等价 --provider stub）、不下载 PDF")
     g3.add_argument("--print-graph", action="store_true", help="打印状态机结构后退出")
@@ -110,13 +114,13 @@ def main(argv: list[str] | None = None) -> int:
             print(g.draw_mermaid())
         return 0
 
-    if not args.topic:
+    if not args.topic and not args.resume:
         parser.print_help()
         return 2
 
     for warn in settings.validate():
         print(f"[配置提醒] {warn}", file=sys.stderr)
-    if settings.llm_provider != "stub" and not settings.model_config().get("api_key"):
+    if not args.resume and settings.llm_provider != "stub" and not settings.model_config().get("api_key"):
         print("\n缺少 LLM API key，无法生成。可先用 --dry-run 走通流程。", file=sys.stderr)
         return 1
 
@@ -132,25 +136,53 @@ def main(argv: list[str] | None = None) -> int:
 
     from src.agent.graph import run_review
 
-    thread_id = args.thread_id or f"run-{int(time.time())}"
     started = time.time()
     try:
-        final = run_review(
-            topic=args.topic,
-            constraints=args.constraints,
-            thread_id=thread_id,
-            with_human=args.human,
-            stream=True,
-        )
+        if args.resume:
+            if not args.thread_id:
+                print("--resume 需要 --thread-id 指定被挂起的运行。", file=sys.stderr)
+                return 2
+            thread_id = args.thread_id
+            final = run_review(
+                topic=args.topic or "",
+                constraints=args.constraints,
+                thread_id=thread_id,
+                with_human=True,
+                feedback=args.feedback or "approve",
+                stream=True,
+            )
+        elif args.human:
+            thread_id = args.thread_id or f"run-{int(time.time())}"
+            final = run_review(
+                topic=args.topic,
+                constraints=args.constraints,
+                thread_id=thread_id,
+                with_human=True,
+                stream=True,
+            )
+        else:
+            thread_id = args.thread_id or f"run-{int(time.time())}"
+            final = run_review(
+                topic=args.topic,
+                constraints=args.constraints,
+                thread_id=thread_id,
+                with_human=False,
+                stream=True,
+            )
+    except RuntimeError as e:
+        if "langgraph-checkpoint-sqlite" in str(e):
+            print("\n[错误]", e, file=sys.stderr)
+            return 1
+        raise
     except KeyboardInterrupt:
-        print(f"\n已中断。用 --thread-id {thread_id} 可从检查点续跑。", file=sys.stderr)
+        print(f"\n已中断。使用 --thread-id {thread_id} --resume 可从检查点续跑。", file=sys.stderr)
         return 130
 
     elapsed = time.time() - started
 
-    if args.human and not final.get("report"):
-        print("\n[人工审核] 图已在 Human 节点前挂起。"
-              f"用相同 thread-id（{thread_id}）继续即可定稿。")
+    if final.get("interrupted"):
+        print("\n[人工审核] 已挂起。运行 "
+              f"`python -m src.main --resume --thread-id {thread_id}` 完成定稿。")
         return 0
 
     artifacts = final.get("artifacts") or {}

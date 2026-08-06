@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import numpy as np
+import pytest
+
+import src.cluster.theme_cluster as TC
 from src.cluster.theme_cluster import choose_k, cluster_papers, embed_texts
 from src.ingest.base import make_paper
 from src.report.bibtex import (
@@ -10,6 +14,16 @@ from src.report.bibtex import (
     format_authors_inline,
     make_cite_key,
 )
+
+
+@pytest.fixture(autouse=True)
+def no_embedding_download(monkeypatch):
+    """离线测试强制 TF-IDF 降级，避免下载 sentence-transformers 模型。
+
+    embedding 路径由下面的 fake embedder 单测专门覆盖，不依赖网络。
+    """
+    monkeypatch.setattr(TC, "_EMBEDDER_TRIED", True)
+    monkeypatch.setattr(TC, "_EMBEDDER", None)
 
 
 def _paper(pid: str, title: str, abstract: str, **kw):
@@ -31,6 +45,47 @@ def test_embed_texts_shape():
     vecs = embed_texts(["deep learning for vision", "graph neural network on molecules"])
     assert vecs.shape[0] == 2
     assert vecs.shape[1] >= 1
+
+
+# --------------------------------------------------------------------------
+# embedding 路径（用 fake embedder 验证代码分支，不下载真实模型）
+# --------------------------------------------------------------------------
+def _fake_embedder():
+    """返回一个确定性的假 embedder：第 i 篇向量在维度 i%2 上置 1。"""
+    class FakeEmbedder:
+        def encode(self, texts, **kw):
+            out = []
+            for i in range(len(texts)):
+                v = np.zeros(4, dtype=np.float32)
+                v[0 if i < len(texts) // 2 else 1] = 1.0
+                out.append(v)
+            return np.array(out, dtype=np.float32)
+
+    return FakeEmbedder()
+
+
+def test_embed_texts_prefers_sentence_transformer(monkeypatch):
+    """embed_texts 在 embedder 可用时应优先走语义向量（维度由 embedder 决定）。"""
+    monkeypatch.setattr(TC, "_EMBEDDER_TRIED", True)
+    monkeypatch.setattr(TC, "_EMBEDDER", _fake_embedder())
+    vecs = embed_texts(["a", "b", "c"])
+    assert vecs.shape == (3, 4)          # 用了 fake 的 4 维，而非 TF-IDF 的 8000 维
+    assert vecs.dtype == np.float32
+
+
+def test_cluster_uses_embedder_when_available(monkeypatch):
+    """embedder 可用时，聚类应基于语义向量把两套主题清晰分开。"""
+    monkeypatch.setattr(TC, "_EMBEDDER_TRIED", True)
+    monkeypatch.setattr(TC, "_EMBEDDER", _fake_embedder())
+    vision = [_paper(f"v{i}", f"Vision paper {i}", "vision image cnn pixels")
+               for i in range(6)]
+    nlp = [_paper(f"n{i}", f"NLP paper {i}", "language text transformer tokens")
+            for i in range(6)]
+    clusters = cluster_papers(vision + nlp, n_clusters=2)
+    assert len(clusters) == 2
+    v_ids = {p["paper_id"] for p in vision}
+    groups = [set(c.paper_ids) for c in clusters]
+    assert any(g == v_ids for g in groups)   # 一个簇恰好是全部 vision
 
 
 def test_cluster_separates_distinct_topics():

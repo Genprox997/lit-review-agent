@@ -9,8 +9,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from datetime import datetime
 from typing import Dict, List, Sequence
+
+from langgraph.types import interrupt
 
 from src.agent import prompts as P
 from src.agent.llm import chat, chat_json
@@ -683,9 +686,24 @@ def _assemble_markdown(
 # 10. Human（可选人工审核挂起点）
 # ==========================================================================
 def human_review(state: AgentState) -> dict:
-    """人工审核占位节点。
+    """人工审核节点（Human-in-the-loop）。
 
-    配合 `compile(interrupt_before=["human_review"])` 使用：
-    图会在此挂起，调用方可修改 state（如删改小节）后再 `invoke(None, config)` 续跑。
+    图运行到此处时调用 `interrupt()` 挂起：把草稿路径交给调用方，等待其用
+    `Command(resume=feedback)` 续跑。feedback 为空或近似 'approve' 视为通过；
+    否则把人工意见写入日志留痕（当前版本不自动重生成，留待后续回环增强）。
     """
-    return {"logs": [_log("Human: 已通过审核（或未启用人工介入）")]}
+    artifacts = state.get("artifacts") or {}
+    report_path = artifacts.get("report")
+    payload = {
+        "kind": "human_review",
+        "message": "综述草稿已生成，请审核后定稿。回复 'approve' 通过，或给出修改意见。",
+        "report_path": report_path,
+    }
+    decision = interrupt(payload)
+    feedback = (decision or "").strip()
+    if feedback and feedback.lower() not in ("approve", "ok", "yes", "通过", "y", "true"):
+        return {
+            "human_feedback": feedback,
+            "logs": [_log(f"Human: 收到审核意见 → {feedback[:200]}")],
+        }
+    return {"logs": [_log("Human: 审核通过，定稿")]}

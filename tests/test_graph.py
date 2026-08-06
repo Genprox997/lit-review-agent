@@ -13,6 +13,8 @@ from src.agent.state import initial_state
 from src.ingest.base import make_paper
 from src.config import get_settings
 
+import src.cluster.theme_cluster as TC
+
 
 # --------------------------------------------------------------------------
 # fixtures
@@ -31,6 +33,13 @@ def stub_env(monkeypatch, tmp_path):
     settings.cache_dir = tmp_path / "cache"
     yield settings
     get_settings(refresh=True)
+
+
+@pytest.fixture(autouse=True)
+def no_embedding_download(monkeypatch):
+    """离线测试强制 TF-IDF 降级，避免下载 sentence-transformers 模型。"""
+    monkeypatch.setattr(TC, "_EMBEDDER_TRIED", True)
+    monkeypatch.setattr(TC, "_EMBEDDER", None)
 
 
 def _fake_pool(n: int = 24):
@@ -238,7 +247,7 @@ def test_full_graph_end_to_end(stub_env, offline_retrieval, tmp_path):
 
 
 def test_graph_with_human_interrupt(stub_env, offline_retrieval):
-    """开启人工审核后，图应在 human_review 之前挂起。"""
+    """开启人工审核后，图应在 human_review 内部挂起，且可用 Command(resume=...) 续跑。"""
     stub_env.target_paper_count = 10
     stub_env.max_retrieval_rounds = 1
 
@@ -247,11 +256,38 @@ def test_graph_with_human_interrupt(stub_env, offline_retrieval):
     state = graph.invoke(initial_state("test topic"), config)
 
     assert state["report"], "挂起前应已完成成稿"
+    assert "__interrupt__" in state, "应在 human_review 处挂起（含 __interrupt__）"
     snapshot = graph.get_state(config)
     assert snapshot.next == ("human_review",), f"应挂起在 human_review，实际 {snapshot.next}"
 
-    resumed = graph.invoke(None, config)  # 续跑收尾
+    from langgraph.types import Command
+    resumed = graph.invoke(Command(resume="approve"), config)  # 续跑收尾
     assert any("Human" in log for log in resumed["logs"])
+
+
+def test_run_review_human_resume(stub_env, offline_retrieval):
+    """run_review 在 --human 时挂起，同一 thread_id + feedback 续跑可定稿（断点续跑）。"""
+    from src.agent.graph import run_review
+
+    stub_env.target_paper_count = 10
+    stub_env.max_retrieval_rounds = 1
+    tid = "resume-e2e"
+
+    # 第一次：开启 human，应在 human_review 处挂起
+    first = run_review("a test topic", thread_id=tid, with_human=True, stream=False)
+    assert first.get("report"), "首次运行应已完成成稿并挂起"
+    assert first.get("interrupted"), "首次运行应标记为挂起态"
+
+    # 续跑：同 thread_id，用 feedback 恢复
+    second = run_review(
+        "a test topic", thread_id=tid, with_human=True,
+        feedback="approve", stream=False,
+    )
+    assert not second.get("interrupted"), "续跑不应再挂起"
+    assert any("Human" in log for log in second.get("logs", [])), "应记录人工审核节点"
+    assert second.get("report"), "续跑应产出最终成稿"
+    for path in second.get("artifacts", {}).values():
+        assert os.path.exists(path), f"产物缺失: {path}"
 
 
 def test_critic_loop_triggers_second_retrieval(stub_env, offline_retrieval, monkeypatch):

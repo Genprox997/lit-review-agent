@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any, Dict, Optional
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
 
 from src.agent.nodes import (
     clusterer,
@@ -83,7 +85,7 @@ def build_graph(
     """构建并编译综述 Agent。
 
     Args:
-        with_human: 是否在 Synthesizer 之后挂起等待人工审核
+        with_human: 是否在 Synthesizer 之后挂起等待人工审核（需持久化检查点以支持跨进程续跑）
         checkpointer: 自定义检查点后端；None 时按配置自动选择
     """
     builder = StateGraph(AgentState)
@@ -126,20 +128,24 @@ def build_graph(
     builder.add_edge("human_review", END)
 
     if checkpointer is None:
-        checkpointer = _default_checkpointer()
+        checkpointer = _default_checkpointer(with_human=with_human)
 
-    compile_kwargs: Dict[str, Any] = {"checkpointer": checkpointer}
-    if with_human:
-        compile_kwargs["interrupt_before"] = ["human_review"]
-
-    graph = builder.compile(**compile_kwargs)
+    # 人工审核的挂起由 human_review 节点内的 interrupt() 实现（可携带审核意见），
+    # 因此这里不再使用 interrupt_before。
+    graph = builder.compile(checkpointer=checkpointer)
     graph.name = "lit-review-agent"
     return graph
 
 
-def _default_checkpointer():
+def _default_checkpointer(with_human: bool = False):
+    """选择检查点后端。
+
+    - with_human=True 或 CHECKPOINT_BACKEND=sqlite → SQLite（持久化，支持跨进程续跑）；
+    - 否则 → 内存（零配置、一次性运行）。
+    缺少 langgraph-checkpoint-sqlite 且要求 human 时直接报错，给出明确安装指引。
+    """
     settings = get_settings()
-    if settings.checkpoint_backend == "sqlite":
+    if with_human or settings.checkpoint_backend == "sqlite":
         try:
             import sqlite3
 
@@ -150,7 +156,14 @@ def _default_checkpointer():
             logger.info("使用 SQLite 检查点：%s", settings.checkpoint_path)
             return SqliteSaver(conn)
         except ImportError:
-            logger.warning("未安装 langgraph-checkpoint-sqlite，回退到内存检查点")
+            if with_human:
+                raise RuntimeError(
+                    "Human-in-the-loop 需要持久化检查点，但未安装 langgraph-checkpoint-sqlite。"
+                    "请运行 `pip install -e \".[persist]\"` 后重试。"
+                )
+            logger.warning(
+                "CHECKPOINT_BACKEND=sqlite 但未安装 langgraph-checkpoint-sqlite，回退到内存检查点"
+            )
 
     from langgraph.checkpoint.memory import InMemorySaver
 
@@ -165,20 +178,62 @@ def run_review(
     constraints: str = "",
     thread_id: str = "default",
     with_human: bool = False,
+    feedback: Optional[str] = None,
     stream: bool = True,
 ) -> AgentState:
-    """跑一次完整综述流程，返回终态。"""
+    """跑一次完整综述流程，返回终态。
+
+    Args:
+        feedback: 非 None 时视为「续跑」——用 ``Command(resume=feedback)`` 从被
+            ``human_review`` 挂起的检查点继续，而不是从头开始。配合 SQLite 检查点
+            即可实现跨进程断点续跑。
+        with_human: 是否在 Synthesizer 之后挂起等待人工审核（强制 SQLite 检查点）。
+    """
     graph = build_graph(with_human=with_human)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 80}
-    state = initial_state(topic, constraints)
+
+    if feedback is not None:
+        # 续跑：先确认该 thread 确实处于 human_review 挂起态，避免误操作全新线程
+        snap = graph.get_state(config)
+        if snap.next and "human_review" in snap.next:
+            initial_input: Any = Command(resume=feedback)
+        else:
+            print(f"[提示] thread_id={thread_id} 未处于挂起态，作为全新运行处理。",
+                  file=sys.stderr)
+            initial_input = initial_state(topic, constraints)
+    else:
+        initial_input = initial_state(topic, constraints)
 
     if not stream:
-        return graph.invoke(state, config)  # type: ignore[return-value]
+        result = graph.invoke(initial_input, config)  # type: ignore[arg-type]
+        if isinstance(result, dict) and "__interrupt__" in result:
+            result = dict(result)
+            result["interrupted"] = True
+        return result  # type: ignore[return-value]
 
-    final: AgentState = state
-    for chunk in graph.stream(state, config, stream_mode="values"):
+    interrupted = False
+    final: AgentState = {}
+    for chunk in graph.stream(initial_input, config, stream_mode="values"):  # type: ignore[arg-type]
+        if "__interrupt__" in chunk:
+            interrupted = True
+            interrupt_tuple = chunk.get("__interrupt__") or ()
+            payload = interrupt_tuple[0].value if interrupt_tuple else {}
+            report_path = (payload or {}).get("report_path")
+            print("\n" + "=" * 72)
+            print("[人工审核] 综述草稿已生成并挂起，等待人工审核。")
+            if report_path:
+                print(f"  草稿文件 : {report_path}")
+            print("  审核后定稿：")
+            print(f"    python -m src.main --resume --thread-id {thread_id}"
+                  + (" --feedback \"你的修改意见（可选）\"" if False else ""))
+            print("=" * 72)
+            final = chunk  # type: ignore[assignment]
+            break
         final = chunk  # type: ignore[assignment]
         logs = chunk.get("logs") or []
         if logs:
             print(logs[-1], flush=True)
+
+    final = dict(final)  # type: ignore[arg-type]
+    final["interrupted"] = interrupted
     return final

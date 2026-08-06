@@ -30,6 +30,8 @@ embed = ["sentence-transformers>=3.0.0"]
 # SQLite 检查点持久化
 persist = ["langgraph-checkpoint-sqlite>=2.0.0"]
 dev = ["pytest>=8.0.0", "pytest-cov>=5.0.0"]
+# 开箱即用：聚类 + 断点续跑 + 测试
+all = ["sentence-transformers>=3.0.0", "langgraph-checkpoint-sqlite>=2.0.0", "pytest>=8.0.0", "pytest-cov>=5.0.0"]
 
 [project.scripts]
 lit-review = "src.main:main"

@@ -130,7 +130,7 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 
 ### 6. 零配置也能跑
 
-- 未装 `sentence-transformers` → 聚类自动降级为 TF-IDF + TruncatedSVD（纯 sklearn，无需下载模型）；
+- 聚类默认用 `sentence-transformers` 的语义向量（`all-MiniLM-L6-v2`，首次运行自动下载约 80MB）；未装该包时自动降级为 TF-IDF + TruncatedSVD（纯 sklearn，无需下载模型）；
 - 未指定簇数 → 用轮廓系数在 `[2, 8]` 区间自动选 k；
 - LLM 抽取失败 → 用摘要首段兜底，保证每篇文献都有可用证据；
 - JSON 解析失败 → 剥离代码围栏 / 截取平衡括号 / 修复尾随逗号，再失败则换 prompt 重试一次。
@@ -158,7 +158,7 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 | `RELEVANCE_GATE` | `0.10` | 相关性闸门阈值，低于此分的论文剔除出候选池；`0` 关闭 |
 | `MIN_POOL_AFTER_GATE` | `20` | 闸门保底：至少保留这么多篇，防止文献池塌缩 |
 | `REPORT_LANGUAGE` | `zh` | `zh` / `en` |
-| `CHECKPOINT_BACKEND` | `memory` | 改 `sqlite` 可断点续跑（需 `pip install -e ".[persist]"`） |
+| `CHECKPOINT_BACKEND` | `memory` | 检查点后端；`--human`/`--resume` 会自动强制 `sqlite`（需 `pip install -e ".[persist]"`，已包含在 `[all]`） |
 
 ### 换 LLM
 
@@ -188,7 +188,9 @@ python -m src.main <主题> [选项]
   --clusters 5                  主题簇数，0=自动
   --lang zh|en                  综述正文语言
   --critic-rounds 2             Critic 打回次数上限
-  --human                       定稿前挂起等待人工审核
+  --human                       定稿前挂起等待人工审核（自动启用 SQLite 检查点）
+  --resume                      续跑被 --human 挂起的 thread（配合 --thread-id）
+  --feedback "意见"             续跑时的人工审核意见（可省略，默认 approve）
 
 其他：
   -o, --output output/          输出目录
@@ -198,27 +200,38 @@ python -m src.main <主题> [选项]
   -v, --verbose                 DEBUG 日志
 ```
 
-### 人工介入
+### 人工介入（断点续跑）
+
+开启 `--human` 后，图会在 `human_review` 节点内调用 `interrupt()` 挂起并生成草稿，**进程退出也不丢失**（用 SQLite 检查点持久化）。审核后再用 `--resume --thread-id <同一ID>` 续跑定稿——这条路径在 `tests/test_graph.py` 的 `test_run_review_human_resume` 里有端到端覆盖。
 
 ```bash
+# 第 1 步：生成草稿并挂起（--human 自动启用 SQLite 检查点）
 python -m src.main "topic" --human --thread-id my-run
+
+# 第 2 步：审阅 output/ 下的 *_review.md 后，同一 ID 续跑定稿
+python -m src.main --resume --thread-id my-run
+# 也可带上审核意见（写入日志留痕，当前版本不自动重生成）
+python -m src.main --resume --thread-id my-run --feedback "第 3 节请补对比实验"
 ```
 
-图会在 `human_review` 前挂起。用相同 `thread-id` 再次调用即可续跑定稿；配合 `CHECKPOINT_BACKEND=sqlite` 可跨进程续跑。
+> 说明：续跑用的是 `Command(resume=feedback)` 而非 `graph.invoke(None)`，这是 LangGraph 1.x 中从 `interrupt()` 挂起恢复的正确方式。未装 `langgraph-checkpoint-sqlite` 时 `--human` 会直接报错并给出安装提示。
 
 程序化使用：
 
 ```python
-from src.agent.graph import build_graph
+from src.agent.graph import build_graph, run_review
 from src.agent.state import initial_state
+from langgraph.types import Command
 
 graph = build_graph(with_human=True)
 config = {"configurable": {"thread_id": "run-1"}, "recursion_limit": 80}
 
-state = graph.invoke(initial_state("your topic"), config)
-# ... 检查/修改 state["sections"] ...
+# 首次运行：成稿并在 human_review 处挂起
+graph.invoke(initial_state("your topic"), config)
+# ... 检查 / 修改 state["sections"] ...
 graph.update_state(config, {"sections": edited_sections})
-final = graph.invoke(None, config)
+# 续跑定稿
+graph.invoke(Command(resume="approve"), config)
 ```
 
 ---
@@ -247,7 +260,8 @@ lit-review-agent/
 │   ├── report/bibtex.py
 │   ├── config.py
 │   └── main.py
-├── tests/                  # 61 个测试，默认不联网
+├── tests/                  # 64 个测试，默认不联网（含 embedding 路径与 HITL 续跑）
+├── .github/workflows/test.yml
 ├── pyproject.toml
 └── .env.example
 ```
@@ -257,20 +271,22 @@ lit-review-agent/
 ## 测试
 
 ```bash
-pip install -e ".[dev]"
-pytest -m "not network"     # 61 个离线测试，约 5s
+pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
+pytest -m "not network"     # 64 个离线测试，约 5s
 pytest -m network           # 2 个联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、聚类可分性与编号、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、人工介入挂起与续跑。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑**。
 
 ---
 
 ## 可选依赖
 
 ```bash
-pip install -e ".[embed]"     # sentence-transformers，语义聚类效果更好
-pip install -e ".[persist]"   # SQLite 检查点，断点续跑
+pip install -e ".[all]"      # embed + persist + dev，开箱即用（推荐）
+# 或按需单独装：
+pip install -e ".[embed]"     # sentence-transformers，语义聚类效果更好（默认已启用）
+pip install -e ".[persist]"   # SQLite 检查点，断点续跑（--human 需要）
 pip install grandalf          # --print-graph 显示 ASCII 图
 ```
 
@@ -280,16 +296,17 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 
 - 中文主题也能跑，但检索式是英文的（学术 API 中文覆盖差），中文文献需另接 CNKI/万方类数据源；
 - `Extractor` 默认只处理排序后前 60 篇，超大文献池需调 `MAX_EXTRACT_PAPERS`；
-- TF-IDF 降级模式下轮廓系数普遍偏低，簇边界不如语义 embedding 清晰，建议装 `[embed]`；
 - 引用编号在 Critic 打回重跑后会重新分配，不保证跨轮次稳定；
+- `Human-in-the-loop` 当前仅支持「审核意见留痕 + 定稿」，暂不支持「修改 state 后自动重生成小节」（重生成回环是后续增强）；
 - **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
-- 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若启用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
+- 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若改用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
 ## 路线
 
 - [x] MVP：arXiv + OpenAlex，摘要模式，扩词/聚类/成稿闭环
 - [x] 全文 PDF 解析、Critic 外环、BibTeX、Human-in-the-loop
 - [x] P0 质量改进：相关性闸门 + 混合排序、全文真正落地、元数据清洗
+- [x] P1 能力补全：Human-in-the-loop 真正可续跑（SQLite 检查点 + `Command(resume)`）、embedding 聚类启用
 - [ ] 向量库持久化文献池（chromadb / faiss），跨主题复用
 - [ ] LaTeX 模板输出
 - [ ] LangSmith 轨迹面板与成本统计
