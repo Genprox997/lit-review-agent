@@ -16,7 +16,7 @@ from typing import Dict, List, Sequence
 from langgraph.types import interrupt
 
 from src.agent import prompts as P
-from src.agent.llm import chat, chat_json
+from src.agent.llm import chat, chat_json, chat_json_many, chat_many
 from src.agent.state import AgentState, Evidence
 from src.agent.tools import (
     apply_relevance_gate,
@@ -221,13 +221,20 @@ def extractor(state: AgentState) -> dict:
     if not targets:
         return {"logs": [_log("Extractor: 无新增文献，跳过")]}
 
-    new_evidence: List[Evidence] = []
+    # 把每个 batch 打包成一次独立的 LLM 调用，整体并发执行（P3-4）
+    batches: List[List[dict]] = []
+    items: List[Dict[str, Any]] = []
     for start in range(0, len(targets), EXTRACT_BATCH_SIZE):
         batch = targets[start : start + EXTRACT_BATCH_SIZE]
         block = "\n".join(_paper_block(p, i + 1) for i, p in enumerate(batch))
         user = P.EXTRACTOR_USER.format(count=len(batch), papers_block=block)
-        data = chat_json("extractor", P.EXTRACTOR_SYSTEM, user, default={})
+        items.append({"node": "extractor", "system": P.EXTRACTOR_SYSTEM, "user": user})
+        batches.append(batch)
 
+    results = chat_json_many(items, default={})
+
+    new_evidence: List[Evidence] = []
+    for batch, data in zip(batches, results):
         got = {}
         for item in (data.get("evidence") or []):
             pid = str(item.get("paper_id", "")).strip()
@@ -363,12 +370,12 @@ def section_writer(state: AgentState) -> dict:
     citation_map = state.get("citation_map") or {}
 
     sections: Dict[str, str] = {}
+    specs: List[tuple] = []  # (cluster_label, allowed_set, llm_item)
     for cluster in clusters:
         pids = cluster["paper_ids"]
         allowed = [citation_map[pid] for pid in pids[:MAX_EVIDENCE_PER_SECTION] if pid in citation_map]
         if not allowed:
             continue
-
         user = P.SECTION_WRITER_USER.format(
             topic=state["topic"],
             section_title=cluster["label"],
@@ -376,13 +383,22 @@ def section_writer(state: AgentState) -> dict:
             allowed_citations=", ".join(f"[{n}]" for n in allowed),
             evidence_block=_evidence_block(pids, by_id, ev_by_id, citation_map),
         )
-        text = chat(
-            "section_writer",
-            P.SECTION_WRITER_SYSTEM.format(lang_hint=_lang_hint()),
-            user,
-        ).strip()
+        specs.append((
+            cluster["label"],
+            set(allowed),
+            {
+                "node": "section_writer",
+                "system": P.SECTION_WRITER_SYSTEM.format(lang_hint=_lang_hint()),
+                "user": user,
+            },
+        ))
+
+    # 各小节互相独立，整体并发生成（P3-4）
+    texts = chat_many([s[2] for s in specs]) if specs else []
+    for (label, allowed_set, _), text in zip(specs, texts):
+        text = (text or "").strip()
         if text:
-            sections[cluster["label"]] = _strip_invalid_citations(text, set(allowed))
+            sections[label] = _strip_invalid_citations(text, allowed_set)
 
     return {
         "sections": sections,
@@ -406,6 +422,7 @@ def ground_claims(state: AgentState) -> dict:
     num_to_pid = {n: pid for pid, n in citation_map.items()}
 
     all_grounded: List[Dict[str, Any]] = []
+    specs: List[tuple] = []  # (title, llm_item)
     for title, body in sections.items():
         used_nums = sorted({int(m) for m in re.findall(r"\[(\d{1,3})\]", body)})
         allowed_pids = [num_to_pid[n] for n in used_nums if n in num_to_pid]
@@ -422,12 +439,19 @@ def ground_claims(state: AgentState) -> dict:
             section_title=title,
             evidence_block="\n".join(ev_lines) or "（无）",
         )
-        data = chat_json(
-            "ground_claims",
-            P.GROUND_CLAIMS_SYSTEM.format(lang_hint=_lang_hint()),
-            user,
-            default={},
-        ) or {}
+        specs.append((
+            title,
+            {
+                "node": "ground_claims",
+                "system": P.GROUND_CLAIMS_SYSTEM.format(lang_hint=_lang_hint()),
+                "user": user,
+            },
+        ))
+
+    # 各小节互相独立，整体并发执行（P3-4）
+    results = chat_json_many([s[1] for s in specs], default={}) if specs else []
+    for (title, _), data in zip(specs, results):
+        data = data or {}
         claims: List[Dict[str, Any]] = []
         for c in (data.get("claims") or []):
             text = str(c.get("text", "")).strip()
@@ -807,3 +831,8 @@ def human_review(state: AgentState) -> dict:
             "logs": [_log(f"Human: 收到审核意见 → {feedback[:200]}")],
         }
     return {"logs": [_log("Human: 审核通过，定稿")]}
+
+
+def skip_human_review(state: AgentState) -> dict:
+    """未启用 --human 时的占位节点：直接放行，不挂起（避免无谓中断）。"""
+    return {"logs": [_log("Human: 未启用人工审核，跳过")]}

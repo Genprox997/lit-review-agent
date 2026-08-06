@@ -69,6 +69,7 @@ class Settings:
     llm_temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.3))
     llm_max_retries: int = field(default_factory=lambda: _env_int("LLM_MAX_RETRIES", 2))
     llm_timeout: int = field(default_factory=lambda: _env_int("LLM_TIMEOUT", 120))
+    llm_max_workers: int = field(default_factory=lambda: _env_int("LLM_MAX_WORKERS", 4))
 
     # ---- 学术 API 礼貌策略 ----
     contact_email: str = field(default_factory=lambda: _env("CONTACT_EMAIL", "you@example.com"))
@@ -118,10 +119,14 @@ class Settings:
 
     # ---- 持久化文献池（跨主题复用）----
     paper_store_enabled: bool = field(default_factory=lambda: _env_bool("PAPER_STORE_ENABLED", True))
-    paper_store_path: str = field(default_factory=lambda: _env("PAPER_STORE_PATH", ".cache/papers.sqlite"))
+    paper_store_path: str = field(
+        default_factory=lambda: _env("PAPER_STORE_PATH", ""),
+        # 留空时由 store 落到 cache_dir/papers.sqlite，便于测试隔离与清理
+    )
 
     # ---- 检索 HTTP 缓存 ----
     http_cache_enabled: bool = field(default_factory=lambda: _env_bool("HTTP_CACHE_ENABLED", True))
+    http_cache_ttl_days: float = field(default_factory=lambda: _env_float("HTTP_CACHE_TTL_DAYS", 7.0))
 
     # ---- 可观测（LangSmith，可选）----
     langsmith_api_key: str = field(default_factory=lambda: _env("LANGSMITH_API_KEY"))

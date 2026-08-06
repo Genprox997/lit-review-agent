@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json as _json
 import logging
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
 import requests
@@ -70,7 +73,7 @@ LIMITERS: Dict[str, RateLimiter] = {
 
 
 # --------------------------------------------------------------------------
-# HTTP
+# HTTP（含磁盘缓存层，P3-4）
 # --------------------------------------------------------------------------
 _session: Optional[requests.Session] = None
 
@@ -84,6 +87,72 @@ def get_session() -> requests.Session:
     return _session
 
 
+# --- 磁盘缓存：把成功的 GET 响应（2xx）落盘，下次同请求直接复用，省配额、提速 ---
+def _http_cache_path(url: str, params: Optional[Dict[str, Any]], source: str) -> Path:
+    key = _json.dumps({"u": url, "p": params or {}, "s": source}, sort_keys=True)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    settings = get_settings()
+    return settings.cache_dir / "http" / f"{source}_{digest}.json"
+
+
+def _http_cache_get(url: str, params: Optional[Dict[str, Any]], source: str) -> Optional[requests.Response]:
+    """命中且未过期则返回重建的 Response，否则 None。"""
+    settings = get_settings()
+    if not settings.http_cache_enabled:
+        return None
+    path = _http_cache_path(url, params, source)
+    if not path.exists():
+        return None
+    try:
+        rec = _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - 缓存损坏直接忽略
+        return None
+    ttl = max(0.0, settings.http_cache_ttl_days) * 86400.0
+    if ttl and (time.time() - rec.get("ts", 0)) > ttl:
+        return None
+    if rec.get("status", 200) >= 400:
+        return None  # 不回放失败响应
+
+    resp = requests.Response()
+    resp.status_code = rec.get("status", 200)
+    resp.reason = rec.get("reason", "OK")
+    resp.url = rec.get("url", url)
+    resp.encoding = rec.get("encoding", "utf-8")
+    resp._content = (rec.get("content") or "").encode("utf-8")
+    try:
+        resp.headers.update(rec.get("headers", {}))
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
+
+
+def _http_cache_put(url: str, params: Optional[Dict[str, Any]], source: str,
+                   resp: requests.Response) -> None:
+    settings = get_settings()
+    if not settings.http_cache_enabled or resp is None:
+        return
+    if resp.status_code >= 400:  # 不缓存失败响应
+        return
+    try:
+        path = _http_cache_path(url, params, source)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": time.time(),
+            "status": resp.status_code,
+            "reason": resp.reason,
+            "url": resp.url,
+            "encoding": resp.encoding or "utf-8",
+            "headers": {k: v for k, v in resp.headers.items()},
+            "content": resp.text,
+        }
+        # 临时写 + 原子替换，避免并发半截文件
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(_json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001 - 缓存写失败不应影响主流程
+        logger.debug("[%s] HTTP 缓存写入失败，忽略: %s", source, url)
+
+
 def http_get(
     url: str,
     *,
@@ -93,7 +162,16 @@ def http_get(
     retries: int = 2,
     stream: bool = False,
 ) -> Optional[requests.Response]:
-    """带限流 + 指数退避重试的 GET。失败返回 None 而不抛异常（单源失败不应中断全局）。"""
+    """带限流 + 指数退避重试的 GET。失败返回 None 而不抛异常（单源失败不应中断全局）。
+
+    命中磁盘缓存（且 2xx、未过期）时直接复用，跳过网络；流式请求（PDF 下载）不缓存。
+    """
+    if not stream:
+        cached = _http_cache_get(url, params, source)
+        if cached is not None:
+            logger.debug("[%s] HTTP 缓存命中: %s", source, url)
+            return cached
+
     limiter = LIMITERS.get(source)
     for attempt in range(retries + 1):
         if limiter:
@@ -106,6 +184,8 @@ def http_get(
                 time.sleep(backoff)
                 continue
             resp.raise_for_status()
+            if not stream:
+                _http_cache_put(url, params, source, resp)
             return resp
         except requests.RequestException as exc:
             if attempt >= retries:

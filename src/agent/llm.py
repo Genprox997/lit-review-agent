@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from src.config import Settings, get_settings
@@ -351,3 +352,78 @@ def chat_json(
     raw = chat(node, system_json, retry_user, json_mode=True, settings=settings)
     parsed = parse_json(raw, default=default)
     return parsed if parsed is not None else default
+
+
+# --------------------------------------------------------------------------
+# 批量并发：把多个互相独立的 LLM 调用并行掉，显著缩短端到端时延
+# （P3-4）。stub 模式直接串行，简单可预测；真实 provider 用线程池并发。
+# --------------------------------------------------------------------------
+def _run_many(
+    items: List[Dict[str, Any]],
+    json_mode: bool,
+    *,
+    settings: Optional[Settings] = None,
+) -> List[str]:
+    """并发执行多个独立调用，返回与 items 等长的结果文本列表。
+
+    items 每个元素：{"node", "system", "user"}。顺序严格对应输入顺序，
+    便于调用方按位置 zip 回原文。
+    """
+    settings = settings or get_settings()
+    if not items:
+        return []
+    # stub / 单条：直接串行，避免无谓起线程（且保证离线测试可预测）
+    if settings.llm_provider == "stub" or len(items) == 1:
+        return [
+            chat(it["node"], it["system"], it["user"], json_mode=json_mode, settings=settings)
+            for it in items
+        ]
+    workers = min(max(1, settings.llm_max_workers), len(items))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [
+            ex.submit(
+                chat, it["node"], it["system"], it["user"],
+                json_mode=json_mode, settings=settings,
+            )
+            for it in items
+        ]
+        return [f.result() for f in futs]
+
+
+def chat_many(
+    items: List[Dict[str, Any]],
+    *,
+    settings: Optional[Settings] = None,
+) -> List[str]:
+    """并发的纯文本生成，见 `_run_many`。"""
+    return _run_many(items, json_mode=False, settings=settings)
+
+
+def chat_json_many(
+    items: List[Dict[str, Any]],
+    *,
+    default: Any = None,
+    settings: Optional[Settings] = None,
+) -> List[Any]:
+    """并发的 JSON 调用：每个 item 单独走 chat_json 的「失败重试一次」逻辑。
+
+    返回与 items 等长的结果列表，单条失败返回 default（不抛，避免一个坏项拖垮整批）。
+    """
+    settings = settings or get_settings()
+    if settings.llm_provider == "stub" or len(items) == 1:
+        return [
+            chat_json(it["node"], it["system"], it["user"], default=default, settings=settings)
+            for it in items
+        ]
+
+    def _one(it: Dict[str, Any]) -> Any:
+        try:
+            return chat_json(it["node"], it["system"], it["user"], default=default, settings=settings)
+        except Exception:  # noqa: BLE001 - 单条失败不影响整批
+            logger.exception("[%s] 并发 JSON 调用失败，返回默认值", it.get("node"))
+            return default
+
+    workers = min(max(1, settings.llm_max_workers), len(items))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_one, it) for it in items]
+        return [f.result() for f in futs]
