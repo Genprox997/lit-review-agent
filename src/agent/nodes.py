@@ -390,6 +390,74 @@ def section_writer(state: AgentState) -> dict:
     }
 
 
+# ==========================================================================
+# 6.5 GroundClaims —— Claim 级证据锚定（P3-2）
+# ==========================================================================
+def ground_claims(state: AgentState) -> dict:
+    """把每个小节中的核心论断拆成 (text, paper_ids, confidence) 三元组。
+
+    让综述从「段落 + [n] 引用」升级到「逐条论断可审计」：每条 claim 都绑定支撑它的
+    具体论文与证据强度，便于读者判断可信度，也方便下游做引用防幻觉二次校验。
+    """
+    sections = state.get("sections") or {}
+    citation_map = state.get("citation_map") or {}
+    ev_by_id = {e["paper_id"]: e for e in (state.get("evidence") or [])}
+    by_id = {p["paper_id"]: p for p in (state.get("papers") or [])}
+    num_to_pid = {n: pid for pid, n in citation_map.items()}
+
+    all_grounded: List[Dict[str, Any]] = []
+    for title, body in sections.items():
+        used_nums = sorted({int(m) for m in re.findall(r"\[(\d{1,3})\]", body)})
+        allowed_pids = [num_to_pid[n] for n in used_nums if n in num_to_pid]
+        if not allowed_pids:
+            continue
+        ev_lines = []
+        for pid in allowed_pids:
+            ev = ev_by_id.get(pid, {})
+            num = citation_map.get(pid)
+            head = f"[{num}] {by_id.get(pid, {}).get('title', '')}"
+            claim = (ev.get("claim") or "").strip()
+            ev_lines.append(f"{head}: {claim[:200]}" if claim else head)
+        user = P.GROUND_CLAIMS_USER.format(
+            section_title=title,
+            evidence_block="\n".join(ev_lines) or "（无）",
+        )
+        data = chat_json(
+            "ground_claims",
+            P.GROUND_CLAIMS_SYSTEM.format(lang_hint=_lang_hint()),
+            user,
+            default={},
+        ) or {}
+        claims: List[Dict[str, Any]] = []
+        for c in (data.get("claims") or []):
+            text = str(c.get("text", "")).strip()
+            conf = str(c.get("confidence", "medium")).lower()
+            if conf not in ("high", "medium", "low"):
+                conf = "medium"
+            valid: List[str] = []
+            for raw in (c.get("paper_ids") or []):
+                pid = str(raw).strip().lstrip("#")
+                if pid in citation_map:
+                    valid.append(pid)
+                elif pid.isdigit() and int(pid) in num_to_pid:
+                    valid.append(num_to_pid[int(pid)])
+            valid = list(dict.fromkeys(valid))
+            if text and valid:
+                claims.append({"text": text, "paper_ids": valid, "confidence": conf})
+        if claims:
+            all_grounded.append({"section": title, "claims": claims})
+
+    total = sum(len(g["claims"]) for g in all_grounded)
+    return {
+        "grounded_claims": all_grounded,
+        "logs": [
+            _log(
+                f"GroundClaims: 为 {len(all_grounded)} 个小节标注 {total} 条 claim 级证据锚定"
+            )
+        ],
+    }
+
+
 def _strip_invalid_citations(text: str, allowed: set) -> str:
     """删除模型编造的、不在候选列表中的引用编号，保证引用可追溯。"""
 
@@ -690,6 +758,25 @@ def _assemble_markdown(
 
     appendix.append("\n### A.4 执行轨迹\n")
     appendix.append("```\n" + "\n".join(state.get("logs") or []) + "\n```")
+
+    # A.6 Claim 级证据锚定（P3-2）：让每条核心论断可追溯、可评强度
+    grounded = state.get("grounded_claims") or []
+    if grounded:
+        appendix.append("\n### A.6 Claim 级证据锚定\n")
+        badge = {"high": "● 强", "medium": "◐ 中", "low": "○ 弱"}
+        lines = []
+        for g in grounded:
+            lines.append(f"**{g.get('section', '')}**")
+            for c in g.get("claims", []):
+                nums = " ".join(
+                    f"[{state.get('citation_map', {}).get(pid)}]"
+                    for pid in c.get("paper_ids", [])
+                    if pid in state.get("citation_map", {})
+                )
+                conf = c.get("confidence", "medium")
+                lines.append(f"- {badge.get(conf, '◐ 中')} {c.get('text', '')} {nums}")
+        appendix.append("\n".join(lines) or "（无）")
+
     parts.append("\n".join(appendix))
 
     return "\n\n".join(parts) + "\n"

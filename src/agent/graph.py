@@ -26,6 +26,7 @@ from src.agent.nodes import (
     critic,
     extractor,
     gap_analyzer,
+    ground_claims,
     human_review,
     query_expander,
     ranker,
@@ -96,6 +97,7 @@ def build_graph(
     builder.add_node("extractor", extractor)
     builder.add_node("clusterer", clusterer)
     builder.add_node("section_writer", section_writer)
+    builder.add_node("ground_claims", ground_claims)
     builder.add_node("critic", critic)
     builder.add_node("gap_analyzer", gap_analyzer)
     builder.add_node("synthesizer", synthesizer)
@@ -114,7 +116,8 @@ def build_graph(
     builder.add_edge("ranker", "extractor")
     builder.add_edge("extractor", "clusterer")
     builder.add_edge("clusterer", "section_writer")
-    builder.add_edge("section_writer", "critic")
+    builder.add_edge("section_writer", "ground_claims")
+    builder.add_edge("ground_claims", "critic")
 
     # 外环
     builder.add_conditional_edges(

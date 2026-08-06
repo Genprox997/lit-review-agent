@@ -76,6 +76,7 @@ class AgentState(TypedDict, total=False):
     critic: CriticReport
     gaps: List[str]
     trends: List[str]
+    grounded_claims: Annotated[List[Dict[str, Any]], operator.add]  # Claim 级证据锚定（P3-2）
 
     # ---- 输出 ----
     report: str                                 # 最终 Markdown 成稿
@@ -104,6 +105,7 @@ def initial_state(topic: str, constraints: str = "") -> AgentState:
         "critic": {},
         "gaps": [],
         "trends": [],
+        "grounded_claims": [],
         "report": "",
         "bibtex": "",
         "artifacts": {},

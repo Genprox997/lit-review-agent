@@ -196,6 +196,28 @@ class StubBackend:
         )
 
     @staticmethod
+    def _ground_claims(user: str) -> str:
+        # 从 evidence_block 中抽取出现的引用编号，造两条假 claim
+        nums = re.findall(r"\[(\d+)\]", user)[:2] or ["1", "2"]
+        return json.dumps(
+            {
+                "claims": [
+                    {
+                        "text": "[stub] 该方向已形成相对成熟的表示学习路线。",
+                        "paper_ids": [nums[0]],
+                        "confidence": "high",
+                    },
+                    {
+                        "text": "[stub] 近年方法在公开基准上取得了一致的性能提升。",
+                        "paper_ids": nums,
+                        "confidence": "medium",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
     def _synthesizer(user: str) -> str:
         cite = (re.findall(r"\[(\d+)\]", user) or ["1"])[0]
         if "撰写摘要与引言" in user:
