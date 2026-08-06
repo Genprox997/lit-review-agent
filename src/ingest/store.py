@@ -133,23 +133,20 @@ class PaperStore:
 
 
 # --------------------------------------------------------------------------
-# 单例访问（读写全局配置开关）
+# 访问入口（读写全局配置开关）
 # --------------------------------------------------------------------------
-_store: Optional[PaperStore] = None
-
-
 def get_paper_store() -> Optional[PaperStore]:
-    """返回全局文献池；`PAPER_STORE_ENABLED=false` 时返回 None。"""
-    global _store
+    """返回文献池；`PAPER_STORE_ENABLED=false` 时返回 None。
+
+    路径优先取 ``PAPER_STORE_PATH``，否则落到 ``cache_dir/papers.sqlite``。
+    每次调用按当前配置构造（不缓存单例），避免测试间通过全局状态相互污染；
+    生产环境配置稳定，重复构造的开销可忽略。
+    """
     settings = get_settings()
     if not settings.paper_store_enabled:
         return None
-    if _store is None:
-        _store = PaperStore(Path(settings.paper_store_path))
-    return _store
-
-
-def reset_paper_store() -> None:
-    """测试用：清空单例，下次 get_paper_store 重新构造。"""
-    global _store
-    _store = None
+    if settings.paper_store_path:
+        path = Path(settings.paper_store_path)
+    else:
+        path = Path(settings.cache_dir) / "papers.sqlite"
+    return PaperStore(path)
