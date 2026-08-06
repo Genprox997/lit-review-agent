@@ -116,6 +116,13 @@ class Settings:
     checkpoint_backend: str = field(default_factory=lambda: _env("CHECKPOINT_BACKEND", "memory").lower())
     checkpoint_path: str = field(default_factory=lambda: _env("CHECKPOINT_PATH", ".cache/checkpoints.sqlite"))
 
+    # ---- 持久化文献池（跨主题复用）----
+    paper_store_enabled: bool = field(default_factory=lambda: _env_bool("PAPER_STORE_ENABLED", True))
+    paper_store_path: str = field(default_factory=lambda: _env("PAPER_STORE_PATH", ".cache/papers.sqlite"))
+
+    # ---- 检索 HTTP 缓存 ----
+    http_cache_enabled: bool = field(default_factory=lambda: _env_bool("HTTP_CACHE_ENABLED", True))
+
     # ---- 可观测（LangSmith，可选）----
     langsmith_api_key: str = field(default_factory=lambda: _env("LANGSMITH_API_KEY"))
     langsmith_project: str = field(default_factory=lambda: _env("LANGSMITH_PROJECT", "lit-review-agent"))
@@ -160,6 +167,7 @@ class Settings:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "pdf").mkdir(parents=True, exist_ok=True)
+        (self.cache_dir / "http").mkdir(parents=True, exist_ok=True)
 
     def apply_langsmith_env(self) -> bool:
         """把 LangSmith 配置透传为标准环境变量，使 langgraph 自动上报轨迹。

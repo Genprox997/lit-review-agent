@@ -306,6 +306,51 @@ def year_range(papers: Sequence[Paper]) -> str:
 # ==========================================================================
 # 全文
 # ==========================================================================
+# ==========================================================================
+# 持久化文献池（跨主题复用）
+# ==========================================================================
+def recall_from_store(
+    queries: Sequence[str], settings: Optional[Settings] = None, top_k: int = 15
+) -> List[Paper]:
+    """从本地文献池召回与检索式语义相近的历史文献，跨主题复用、省配额。"""
+    from src.ingest import store as store_mod
+
+    store = store_mod.get_paper_store()
+    if not store:
+        return []
+    out: List[Paper] = []
+    for q in queries:
+        out.extend(store.recall(q, top_k=top_k))
+    # 按规范化主键去重；防御性跳过缺 paper_id 的残次条目
+    seen: set = set()
+    uniq: List[Paper] = []
+    for p in out:
+        if not p.get("paper_id"):
+            continue
+        k = store_mod._paper_key(p)
+        if k and k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
+
+
+def hydrate_from_store(papers: Sequence[Paper]) -> List[Paper]:
+    """用本地缓存回填缺失字段（引用数 / 摘要 / DOI 等）。"""
+    from src.ingest import store as store_mod
+
+    store = store_mod.get_paper_store()
+    return store.hydrate(papers) if store else list(papers)
+
+
+def save_to_store(papers: Sequence[Paper]) -> None:
+    """把本轮文献池写回本地文献池。"""
+    from src.ingest import store as store_mod
+
+    store = store_mod.get_paper_store()
+    if store:
+        store.upsert(papers)
+
+
 def enrich_topn_fulltext(papers: List[Paper], settings: Optional[Settings] = None) -> int:
     """仅对 Top-N 文献拉 OA 全文，其余保持摘要模式（对应设计方案 6.1）。
 

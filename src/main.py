@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="续跑时的人工审核意见（可省略，默认 approve 通过）")
     g3.add_argument("--dry-run", action="store_true",
                     help="离线试跑：不调 LLM（等价 --provider stub）、不下载 PDF")
+    g3.add_argument("--no-store", action="store_true",
+                    help="不读写本地持久化文献池（跨主题复用失效，但每次重新检索）")
+    g3.add_argument("--no-http-cache", action="store_true",
+                    help="禁用检索 HTTP 磁盘缓存，每次都重新打学术 API")
     g3.add_argument("--print-graph", action="store_true", help="打印状态机结构后退出")
     g3.add_argument("-v", "--verbose", action="store_true", help="输出 DEBUG 日志")
     return p
@@ -89,6 +93,10 @@ def _apply_overrides(args: argparse.Namespace) -> None:
 
     if args.no_fulltext or args.dry_run:
         os.environ["ENABLE_FULLTEXT"] = "false"
+    if args.no_store:
+        os.environ["PAPER_STORE_ENABLED"] = "false"
+    if args.no_http_cache:
+        os.environ["HTTP_CACHE_ENABLED"] = "false"
     if args.dry_run:
         os.environ["LLM_PROVIDER"] = "stub"
 

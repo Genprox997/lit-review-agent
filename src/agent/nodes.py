@@ -23,8 +23,11 @@ from src.agent.tools import (
     compute_relevance,
     dedup_papers,
     enrich_topn_fulltext,
+    hydrate_from_store,
     multi_source_search,
     rank_papers,
+    recall_from_store,
+    save_to_store,
     year_histogram,
     year_range,
 )
@@ -111,6 +114,11 @@ def retriever(state: AgentState) -> dict:
     if not pending:
         pending = state.get("queries") or [state["topic"]]
 
+    # 跨主题复用：先从本地文献池召回与检索式相近的历史文献，再打网络
+    seed = recall_from_store(pending, settings)
+    if seed:
+        logger.info("Retriever: 从本地文献池召回 %d 条历史文献", len(seed))
+
     original_limit = settings.max_results_per_query
     if round_no > 0:
         settings.max_results_per_query = min(100, original_limit * (round_no + 1))
@@ -120,7 +128,11 @@ def retriever(state: AgentState) -> dict:
     finally:
         settings.max_results_per_query = original_limit
 
-    merged = dedup_papers(list(state.get("papers") or []) + fresh)
+    merged = dedup_papers(list(state.get("papers") or []) + seed + fresh)
+
+    # 用本地缓存回填引用数/摘要/DOI，并写回本轮文献池（跨运行复用）
+    merged = hydrate_from_store(merged)
+    save_to_store(merged)
 
     return {
         "papers": merged,
@@ -128,8 +140,9 @@ def retriever(state: AgentState) -> dict:
         "retrieval_round": round_no + 1,
         "logs": [
             _log(
-                f"Retriever(第 {round_no + 1} 轮): 新检索 {len(fresh)} 条，"
-                f"合并去重后文献池 {len(merged)} 篇"
+                f"Retriever(第 {round_no + 1} 轮): 新检索 {len(fresh)} 条"
+                + (f"（本地召回 {len(seed)} 条）" if seed else "")
+                + f"，合并去重后文献池 {len(merged)} 篇"
             )
         ],
     }
