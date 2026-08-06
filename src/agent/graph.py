@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
@@ -32,6 +32,7 @@ from src.agent.nodes import (
     ranker,
     retriever,
     section_writer,
+    skip_human_review,
     synthesizer,
 )
 from src.agent.state import AgentState, initial_state
@@ -101,7 +102,8 @@ def build_graph(
     builder.add_node("critic", critic)
     builder.add_node("gap_analyzer", gap_analyzer)
     builder.add_node("synthesizer", synthesizer)
-    builder.add_node("human_review", human_review)
+    # 仅在启用 --human 时挂起等待审核；否则用占位节点直接放行（避免无谓中断）
+    builder.add_node("human_review", human_review if with_human else skip_human_review)
 
     builder.add_edge(START, "query_expander")
     builder.add_edge("query_expander", "retriever")
@@ -183,6 +185,7 @@ def run_review(
     with_human: bool = False,
     feedback: Optional[str] = None,
     stream: bool = True,
+    on_progress: Optional[Callable[[str, Any], None]] = None,
 ) -> AgentState:
     """跑一次完整综述流程，返回终态。
 
@@ -230,13 +233,30 @@ def run_review(
             print(f"    python -m src.main --resume --thread-id {thread_id}"
                   + (" --feedback \"你的修改意见（可选）\"" if False else ""))
             print("=" * 72)
+            if on_progress:
+                on_progress("human_review", {"report_path": report_path})
             final = chunk  # type: ignore[assignment]
             break
         final = chunk  # type: ignore[assignment]
         logs = chunk.get("logs") or []
         if logs:
             print(logs[-1], flush=True)
+            if on_progress:
+                on_progress("progress", logs[-1])
 
     final = dict(final)  # type: ignore[arg-type]
     final["interrupted"] = interrupted
+    if on_progress:
+        if interrupted:
+            on_progress("interrupted", {"report_path": (final.get("artifacts") or {}).get("report")})
+        else:
+            on_progress(
+                "done",
+                {
+                    "paper_count": len(final.get("papers") or []),
+                    "citation_count": len(final.get("citation_map") or {}),
+                    "section_count": len(final.get("sections") or {}),
+                    "artifacts": final.get("artifacts") or {},
+                },
+            )
     return final

@@ -78,12 +78,13 @@ flowchart TD
 | `QueryExpander` | 主题 → 5-8 条英文检索式（同义词/方法名/数据集/评测/交叉领域）；打回时只生成补缺口的新检索式 |
 | `Retriever` | 并发打多源 API（arXiv / OpenAlex / S2 / PubMed / Crossref，源间并行、源内串行以尊重限流），与已有池合并 |
 | `Ranker` | 三级去重 → OpenAlex 补引用数 → 综合打分排序 → 对 Top-N 拉全文 |
-| `Extractor` | 分批（5 篇/次）抽取「方法/结论/数据集/指标」，绑定 `paper_id` |
+| `Extractor` | 分批（5 篇/次）抽取「方法/结论/数据集/指标」，绑定 `paper_id`；各批并发（P3-4） |
 | `Clusterer` | embedding + KMeans 分簇 → LLM 起小节标题 → 分配引用编号 |
-| `SectionWriter` | 每簇生成 300-600 字带 `[n]` 内联引用的段落 |
+| `SectionWriter` | 每簇生成 300-600 字带 `[n]` 内联引用的段落；各簇并发（P3-4） |
 | `Critic` | 检查覆盖度/矛盾处理/证据密度/结构，判 `pass` 或 `need_more` |
 | `GapAnalyzer` | 结合年份分布与簇分布，识别研究空白与演进趋势 |
 | `Synthesizer` | 摘要+引言+小节+空白+结论+参考文献+BibTeX，落盘 |
+| `GroundClaims` | 把每小节核心论断拆成 `(text, paper_ids, confidence)`（P3-2）；各小节并发（P3-4） |
 | `Human` | 可选挂起点，人工改完 state 再续跑 |
 
 ---
@@ -150,6 +151,11 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 - DOI 经正则校验，明显非法的（缺 `10.` 前缀、含空白、后缀为空）直接丢弃，避免畸形 DOI 写进 BibTeX；
 - 检索层常把「arXiv 预印本」与正式期刊 DOI 并存，据 **DOI 前缀 → 期刊名** 映射（如 `10.1364/AO`→Applied Optics、`10.1109`→IEEE、`10.1038`→Nature）在输出时还原真实 venue，纠正「arXiv preprint 配 Optics Express DOI」类错位，同时把条目类型从 `misc` 升级为 `article`/`inproceedings`。
 
+### 8. LLM 并发与检索缓存（P3-4）
+
+- **LLM 并发**：`Extractor`（按 5 篇一批）、`SectionWriter`（按主题簇）、`GroundClaims`（按小节）里的 LLM 调用彼此独立，用线程池（`chat_json_many` / `chat_many`，并发度 `LLM_MAX_WORKERS`，默认 4）并行执行，端到端时延近似从「Σ 单条」降到「最慢单条」。stub 模式自动串行（无并发意义，且保证离线测试可预测）。
+- **检索 HTTP 磁盘缓存**：所有学术 API 的 GET 响应（2xx）按 `url+params+source` 哈希落盘到 `.cache/http/`，命中且未过期（默认 7 天）时直接复用、跳过网络——跨运行省配额、断网可复现；失败响应（429/5xx）不缓存，过期自动回源。流式下载（PDF）不走缓存。
+
 ---
 
 ## 配置
@@ -169,6 +175,9 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 | `MIN_POOL_AFTER_GATE` | `20` | 闸门保底：至少保留这么多篇，防止文献池塌缩 |
 | `REPORT_LANGUAGE` | `zh` | `zh` / `en` |
 | `CHECKPOINT_BACKEND` | `memory` | 检查点后端；`--human`/`--resume` 会自动强制 `sqlite`（需 `pip install -e ".[persist]"`，已包含在 `[all]`） |
+| `LLM_MAX_WORKERS` | `4` | LLM 调用并发线程数（P3-4）：Extractor / SectionWriter / GroundClaims 的批量调用并行执行，缩短端到端时延 |
+| `HTTP_CACHE_ENABLED` | `true` | 检索 GET 响应磁盘缓存开关（P3-4）：命中则跳过网络，省学术 API 配额 |
+| `HTTP_CACHE_TTL_DAYS` | `7` | 缓存有效期（天）；过期自动回源重取 |
 
 ### 换 LLM
 
@@ -207,6 +216,8 @@ python -m src.main <主题> [选项]
   --thread-id xxx               检查点线程 ID，同名可断点续跑
   --dry-run                     离线试跑：stub LLM + 不下载 PDF（仅验证流程）
   --print-graph                 打印状态机结构
+  --no-store                   不读写本地持久化文献池（跨主题复用失效，每次重新检索）
+  --no-http-cache               禁用检索 HTTP 磁盘缓存，每次都重新打学术 API
   -v, --verbose                 DEBUG 日志
 ```
 
@@ -268,6 +279,33 @@ curl -X POST http://localhost:8000/review \
 
 返回 `{topic, paper_count, citation_count, section_count, gaps, artifacts}`，`artifacts` 给出生成的 `md` / `bib` / `json` 绝对路径。API 模式默认 `with_human=False`；若 LLM 未配 key 返回 400，未生成成稿返回 422/500 并带原因。
 
+### 流式 API + 自包含 Web UI（P3-3）
+
+除了阻塞式的 `POST /review`，还提供 **SSE 流式接口** `POST /review/stream`，边生成边推送进度（每个节点一条 `progress` 事件，结束推 `done` / 出错推 `error`），适合前端实时展示。
+
+```bash
+# 浏览器打开自带的 Web UI（GET / 返回，无需任何前端构建）
+open http://localhost:8000/
+
+# 或命令行直接订阅 SSE
+curl -N -X POST http://localhost:8000/review/stream \
+     -H "Content-Type: application/json" \
+     -d '{"topic": "diffusion models for image super-resolution", "lang": "en"}'
+```
+
+`GET /` 是一个**单文件 Web UI**：一个主题输入框 + 约束框 + 实时滚动的进度日志，纯原生 JS 直接 `fetch('/review/stream')` 读 SSE，不依赖任何前端框架。把它嵌进现有系统或本地起服务试用都很方便。
+
+返回结构（流式 `done` 事件与 `POST /review` 一致）：
+
+```json
+{
+  "topic": "diffusion models ...",
+  "paper_count": 40, "citation_count": 32, "section_count": 5,
+  "gaps": ["..."],
+  "artifacts": {"report": ".../review.md", "bibtex": ".../references.bib", "papers": ".../papers.json"}
+}
+```
+
 ---
 
 ## 可观测（LangSmith）
@@ -309,7 +347,7 @@ lit-review-agent/
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 66 个离线测试，默认不联网（含 embedding 路径、HITL 续跑、PubMed/Crossref）
+├── tests/                  # 89 个离线测试，默认不联网（含 embedding 路径、HITL 续跑、PubMed/Crossref、HTTP 缓存、LLM 并发）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -320,7 +358,7 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 66 个离线测试，约 5s
+pytest -m "not network"     # 89 个离线测试，约 3 分钟（主要为端到端 stub 流程）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
@@ -361,6 +399,9 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] P2 服务化：FastAPI HTTP 入口（`src/api.py`）
 - [x] P2 可观测：LangSmith 环境变量接线（有 key 自动开启轨迹）
 - [x] P2 文档与示例：README Mermaid 图 + `output/deformable_mirror_*` 示例、真 LLM 测试脚手架（有 key 时运行）
-- [ ] 向量库持久化文献池（chromadb / faiss），跨主题复用（架构改动较大，单列）
+- [x] P3-1 跨主题持久化文献池：SQLite 轻量存储（`src/ingest/store.py`），历史文献可召回/回填/复用，省检索配额（设计里的 chromadb/faiss 重方案降级为 SQLite，足够覆盖「跨主题复用」目标）
+- [x] P3-2 Claim 级证据锚定：每个核心论断绑定支撑论文 + 证据强度（high/medium/low），写入成稿附录 A.6，可审计、可二次校验引用防幻觉
+- [x] P3-3 流式 API + Web UI：`POST /review/stream` SSE 实时进度 + `GET /` 自包含单文件 Web UI（`src/api.py`）
+- [x] P3-4 性能工程：LLM 批量并发（`chat_json_many`/`chat_many`，Extractor/SectionWriter/GroundClaims 并行）+ 检索 HTTP 磁盘缓存（`.cache/http/`，省配额、断网可复现）
 - [ ] LaTeX 模板输出（设计列入，未实现）
 - [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
