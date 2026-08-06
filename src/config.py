@@ -116,6 +116,13 @@ class Settings:
     checkpoint_backend: str = field(default_factory=lambda: _env("CHECKPOINT_BACKEND", "memory").lower())
     checkpoint_path: str = field(default_factory=lambda: _env("CHECKPOINT_PATH", ".cache/checkpoints.sqlite"))
 
+    # ---- 可观测（LangSmith，可选）----
+    langsmith_api_key: str = field(default_factory=lambda: _env("LANGSMITH_API_KEY"))
+    langsmith_project: str = field(default_factory=lambda: _env("LANGSMITH_PROJECT", "lit-review-agent"))
+    langsmith_tracing: bool = field(
+        default_factory=lambda: _env_bool("LANGSMITH_TRACING", _env_bool("LANGCHAIN_TRACING_V2", False))
+    )
+
     # ------------------------------------------------------------------
     @property
     def user_agent(self) -> str:
@@ -154,6 +161,23 @@ class Settings:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / "pdf").mkdir(parents=True, exist_ok=True)
 
+    def apply_langsmith_env(self) -> bool:
+        """把 LangSmith 配置透传为标准环境变量，使 langgraph 自动上报轨迹。
+
+        返回是否启用了追踪。仅在提供 API key 时打开 `LANGCHAIN_TRACING_V2`，
+        否则保持关闭以免无 key 时报错。
+        """
+        if not self.langsmith_api_key:
+            return False
+        if self.langsmith_tracing or os.getenv("LANGCHAIN_TRACING_V2") != "true":
+            os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_API_KEY"] = self.langsmith_api_key
+        if self.langsmith_project:
+            os.environ["LANGCHAIN_PROJECT"] = self.langsmith_project
+        logger = logging.getLogger(__name__)
+        logger.info("LangSmith 追踪已开启（project=%s）", self.langsmith_project)
+        return True
+
     def validate(self) -> List[str]:
         """返回配置告警列表（不抛异常，交由调用方决定是否阻断）。"""
         warns: List[str] = []
@@ -167,7 +191,9 @@ class Settings:
                 "CONTACT_EMAIL 仍是占位值。学术 API 靠 mailto 识别善意机器人，"
                 "建议填真实邮箱以获得更高配额。"
             )
-        unknown = set(self.enabled_sources) - {"arxiv", "openalex", "semantic_scholar"}
+        unknown = set(self.enabled_sources) - {
+            "arxiv", "openalex", "semantic_scholar", "pubmed", "crossref"
+        }
         if unknown:
             warns.append(f"ENABLED_SOURCES 含未知源：{sorted(unknown)}")
         return warns
@@ -181,4 +207,5 @@ def get_settings(refresh: bool = False) -> Settings:
     global _settings
     if _settings is None or refresh:
         _settings = Settings()
+        _settings.apply_langsmith_env()
     return _settings

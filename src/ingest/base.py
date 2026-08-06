@@ -62,6 +62,8 @@ LIMITERS: Dict[str, RateLimiter] = {
     "arxiv": RateLimiter(3.0, "arxiv"),            # arXiv 明确要求 >= 3s
     "openalex": RateLimiter(0.12, "openalex"),     # polite pool 约 10 req/s
     "semantic_scholar": RateLimiter(3.2, "semantic_scholar"),  # 无 key 100 次 / 5min
+    "pubmed": RateLimiter(0.34, "pubmed"),        # NCBI 无 key 限 3 次/秒
+    "crossref": RateLimiter(0.1, "crossref"),      # 带 mailto 约 30~50 次/秒，保守
     "unpaywall": RateLimiter(0.15, "unpaywall"),
     "pdf": RateLimiter(1.0, "pdf"),
 }

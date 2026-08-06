@@ -190,3 +190,193 @@ def test_live_openalex():
     papers = search_openalex("physics-informed neural networks", per_page=5)
     assert len(papers) > 0
     assert any(p["citation_count"] > 0 for p in papers)
+
+
+# --------------------------------------------------------------------------
+# PubMed / Crossref 离线解析（monkeypatch http_get 返回假响应）
+# --------------------------------------------------------------------------
+class _FakeResp:
+    def __init__(self, *, json=None, content=b"", text=""):
+        self._json = json
+        self.content = content
+        self.text = text
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no json")
+        return self._json
+
+
+_PUBMED_XML = b"""<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation Status="MEDLINE">
+      <PMID Version="1">1</PMID>
+      <Article>
+        <ArticleTitle>Adaptive Optics for Deformable Mirrors</ArticleTitle>
+        <Abstract><AbstractText>We present a method for wavefront control.</AbstractText></Abstract>
+        <AuthorList><Author><LastName>Smith</LastName><ForeName>John A</ForeName></Author></AuthorList>
+        <Journal><Title>Optics Express</Title>
+          <JournalIssue><PubDate><Year>2021</Year></PubDate></JournalIssue></Journal>
+        <ELocationID EIdType="doi" ValidYN="Y">10.1364/OE.2021.0001</ELocationID>
+      </Article>
+    </MedlineCitation>
+  </PubmedArticle>
+  <PubmedArticle>
+    <MedlineCitation Status="MEDLINE">
+      <PMID Version="1">2</PMID>
+      <Article>
+        <ArticleTitle>Another Study on Mirrors</ArticleTitle>
+        <Abstract><AbstractText>Another abstract text.</AbstractText></Abstract>
+        <AuthorList><Author><LastName>Doe</LastName><Initials>J</Initials></Author></AuthorList>
+        <Journal><Title>Applied Optics</Title>
+          <JournalIssue><PubDate><Year>2022</Year></PubDate></JournalIssue></Journal>
+      </Article>
+    </MedlineCitation>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+
+
+def _fake_pubmed_get(url, *, source, params=None, timeout=25, retries=2, stream=False):
+    if "esearch.fcgi" in url:
+        return _FakeResp(json={"esearchresult": {"idlist": ["1", "2"]}})
+    if "efetch.fcgi" in url:
+        return _FakeResp(content=_PUBMED_XML)
+    if "idconv" in url:
+        return _FakeResp(json={"records": [
+            {"pmid": "1", "pmcid": "PMC111", "oa": "1"},
+            {"pmid": "2"},
+        ]})
+    return None
+
+
+def test_search_pubmed_parses_and_oa(monkeypatch):
+    import src.ingest.pubmed as pubmed_mod
+
+    monkeypatch.setattr(pubmed_mod, "http_get", _fake_pubmed_get)
+    papers = pubmed_mod.search_pubmed("deformable mirror", max_results=10)
+    assert len(papers) == 2
+
+    by_id = {p["paper_id"]: p for p in papers}
+    p1 = by_id["doi:10.1364/oe.2021.0001"]
+    assert p1["title"] == "Adaptive Optics for Deformable Mirrors"
+    assert p1["year"] == 2021
+    assert p1["venue"] == "Optics Express"
+    assert p1["authors"] == ["John A Smith"]
+    assert p1["pdf_url"] == "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC111/pdf/"
+    assert p1["url"] == "https://pubmed.ncbi.nlm.nih.gov/1/"
+
+    p2 = by_id["pmid:2"]
+    assert p2["year"] == 2022
+    assert p2["pdf_url"] is None  # 无 PMC OA，pdf_url 留空
+
+
+def test_search_one_pubmed_dispatched(monkeypatch):
+    from src.agent.tools import _search_one
+    from src.config import get_settings
+    import src.ingest.pubmed as pubmed_mod
+
+    monkeypatch.setattr(pubmed_mod, "http_get", _fake_pubmed_get)
+    out = _search_one("pubmed", "deformable mirror", get_settings(refresh=True))
+    assert len(out) == 2
+    assert all(p["source"] == "pubmed" for p in out)
+
+
+_CROSSREF_ITEM = {
+    "DOI": "10.1145/123.456",
+    "title": ["A Crossref Paper Title"],
+    "author": [{"given": "Jane", "family": "Roe"}, {"given": "Bob", "family": "Lee"}],
+    "issued": {"date-parts": [[2020, 5]]},
+    "abstract": "<jats:p>We study <jats:bold>things</jats:bold>.</jats:p>",
+    "container-title": ["Journal of Stuff"],
+    "is-referenced-by-count": 42,
+    "URL": "https://doi.org/10.1145/123.456",
+    "type": "journal-article",
+}
+
+
+def _fake_crossref_get(url, *, source, params=None, timeout=25, retries=2, stream=False):
+    return _FakeResp(json={"message": {"items": [_CROSSREF_ITEM]}})
+
+
+def test_search_crossref_parses(monkeypatch):
+    import src.ingest.crossref as crossref_mod
+
+    monkeypatch.setattr(crossref_mod, "http_get", _fake_crossref_get)
+    papers = crossref_mod.search_crossref("crossref paper", max_results=10)
+    assert len(papers) == 1
+    p = papers[0]
+    assert p["paper_id"] == "doi:10.1145/123.456"
+    assert p["title"] == "A Crossref Paper Title"
+    assert p["authors"] == ["Jane Roe", "Bob Lee"]
+    assert p["year"] == 2020
+    assert p["citation_count"] == 42
+    assert p["abstract"] == "We study things."  # JATS 标签被剥除
+    assert p["pdf_url"] is None                  # 出版社页，靠 Unpaywall 兜底
+    assert p["source"] == "crossref"
+
+
+def test_search_one_crossref_dispatched(monkeypatch):
+    from src.agent.tools import _search_one
+    from src.config import get_settings
+    import src.ingest.crossref as crossref_mod
+
+    monkeypatch.setattr(crossref_mod, "http_get", _fake_crossref_get)
+    out = _search_one("crossref", "crossref paper", get_settings(refresh=True))
+    assert len(out) == 1
+    assert out[0]["source"] == "crossref"
+
+
+# --------------------------------------------------------------------------
+# LLM 429 退避重试（离线）
+# --------------------------------------------------------------------------
+def test_llm_429_backoff_retries(monkeypatch):
+    from src.agent import llm as llm_mod
+    from src.config import Settings
+
+    # 用局部 Settings 实例，避免污染全局单例影响其它测试
+    settings = Settings()
+    settings.llm_provider = "deepseek"
+    settings.llm_max_retries = 1  # 允许 1 次重试
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda *a, **k: None)  # 加速测试
+
+    class _FakeRateLimit(Exception):
+        status_code = 429
+
+    class _FakeResp:
+        content = "generated text"
+
+    calls = {"n": 0}
+
+    class _FakeModel:
+        def invoke(self, messages):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _FakeRateLimit("rate limited")
+            return _FakeResp()
+
+    monkeypatch.setattr(llm_mod, "_get_chat_model", lambda s, j: _FakeModel())
+    out = llm_mod.chat("section_writer", "sys", "user", settings=settings)
+    assert out == "generated text"
+    assert calls["n"] == 2  # 第 1 次 429，第 2 次成功
+
+
+def test_llm_429_eventually_raises(monkeypatch):
+    from src.agent import llm as llm_mod
+    from src.config import Settings
+
+    settings = Settings()
+    settings.llm_provider = "deepseek"
+    settings.llm_max_retries = 1
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda *a, **k: None)
+
+    class _FakeRateLimit(Exception):
+        status_code = 429
+
+    class _FakeModel:
+        def invoke(self, messages):
+            raise _FakeRateLimit("always limited")
+
+    monkeypatch.setattr(llm_mod, "_get_chat_model", lambda s, j: _FakeModel())
+    with pytest.raises(Exception):
+        llm_mod.chat("section_writer", "sys", "user", settings=settings)
+

@@ -17,8 +17,10 @@ import numpy as np
 from src.config import Settings, get_settings
 from src.ingest.arxiv_client import search_arxiv
 from src.ingest.base import Paper, normalize_title_key
+from src.ingest.crossref import search_crossref
 from src.ingest.downloader import fetch_fulltexts
 from src.ingest.openalex import enrich_citations, search_openalex
+from src.ingest.pubmed import search_pubmed
 from src.ingest.semantic_scholar import search_semantic_scholar
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,10 @@ def _search_one(source: str, query: str, settings: Settings) -> List[Paper]:
             return search_openalex(query, per_page=limit, min_year=settings.min_year)
         if source == "semantic_scholar":
             return search_semantic_scholar(query, limit=limit, min_year=settings.min_year)
+        if source == "pubmed":
+            return search_pubmed(query, max_results=limit, min_year=settings.min_year)
+        if source == "crossref":
+            return search_crossref(query, max_results=limit, min_year=settings.min_year)
     except Exception as exc:
         logger.warning("[%s] 检索 %r 异常: %s", source, query, exc)
     return []

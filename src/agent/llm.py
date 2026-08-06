@@ -13,11 +13,34 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from src.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+# 延迟导入 OpenAI 异常类型（langchain_openai 依赖 openai，但用桩模式下不应强依赖）。
+try:  # pragma: no cover - 取决于是否安装 openai
+    from openai import APIStatusError, RateLimitError as _OpenAIRateLimitError
+except Exception:  # pragma: no cover
+    _OpenAIRateLimitError = None  # type: ignore
+    APIStatusError = None  # type: ignore
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """判断异常是否为 429 限流（兼容 OpenAI / langchain 包装）。"""
+    if _OpenAIRateLimitError is not None and isinstance(exc, _OpenAIRateLimitError):
+        return True
+    if APIStatusError is not None and isinstance(exc, APIStatusError):
+        return getattr(exc, "status_code", None) == 429
+    # langchain 可能抛自己的 RateLimitError；或任意异常的文本/状态码含 429
+    if "ratelimit" in type(exc).__name__.lower():
+        return True
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    return "429" in str(exc) and ("rate" in str(exc).lower() or "limit" in str(exc).lower())
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
@@ -250,7 +273,31 @@ def chat(
     model = _get_chat_model(settings, json_mode)
     messages: List[tuple] = [("system", system), ("human", user)]
     logger.debug("[%s] 调用 LLM，user prompt %d 字符", node, len(user))
-    resp = model.invoke(messages)
+
+    max_retries = max(0, settings.llm_max_retries)
+    last_exc: Optional[Exception] = None
+    resp = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = model.invoke(messages)
+            break
+        except Exception as exc:  # noqa: BLE001 - 需区分限流与其他错误
+            if _is_rate_limit_error(exc):
+                last_exc = exc
+                backoff = 2 ** attempt * 5  # 5s, 10s, 20s ...
+                logger.warning(
+                    "[%s] LLM 触发 429 限流，%ds 后重试（第 %d/%d 次）",
+                    node, backoff, attempt + 1, max_retries,
+                )
+                if attempt < max_retries:
+                    time.sleep(backoff)
+                    continue
+            raise
+
+    if resp is None:  # 全部重试耗尽仍未拿到响应
+        assert last_exc is not None
+        raise last_exc
+
     content = resp.content
     if isinstance(content, list):  # 部分 provider 返回分块内容
         content = "".join(

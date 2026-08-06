@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-c", "--constraints", default="", help="额外约束，如「只看 2020 年后的工作」")
 
     g = p.add_argument_group("检索")
-    g.add_argument("--sources", help="启用的检索源，逗号分隔：arxiv,openalex,semantic_scholar")
+    g.add_argument("--sources", help="启用的检索源，逗号分隔：arxiv,openalex,semantic_scholar,pubmed,crossref")
     g.add_argument("-n", "--target", type=int, help="文献池目标规模（默认 40）")
     g.add_argument("--per-query", type=int, help="单条检索式单源最大返回条数（默认 25）")
     g.add_argument("--min-year", type=int, help="只保留该年份及之后的文献")

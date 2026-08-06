@@ -33,6 +33,16 @@ python -m src.main "retrieval augmented generation"
 | `*_references.bib` | BibTeX，可直接进 LaTeX |
 | `*_papers.json` | 完整文献池元数据（含得分、引用编号），便于人工复核 |
 
+### 示例输出
+
+仓库自带一份用真实 DeepSeek 生成的中文综述样例（真实 LLM 跑通，84 篇引用与 BibTeX 完全对齐）：
+
+- `output/deformable_mirror_review.md` —— 综述正文
+- `output/deformable_mirror_references.bib` —— 参考文献 BibTeX
+- `output/deformable_mirror_papers.json` —— 文献池元数据
+
+> 复现：`python -m src.main "deformable mirror wavefront control" --provider deepseek`（需填 `DEEPSEEK_API_KEY`）。
+
 ---
 
 ## 工作流
@@ -66,7 +76,7 @@ flowchart TD
 | 节点 | 职责 |
 |------|------|
 | `QueryExpander` | 主题 → 5-8 条英文检索式（同义词/方法名/数据集/评测/交叉领域）；打回时只生成补缺口的新检索式 |
-| `Retriever` | 并发打多源 API（源间并行、源内串行以尊重限流），与已有池合并 |
+| `Retriever` | 并发打多源 API（arXiv / OpenAlex / S2 / PubMed / Crossref，源间并行、源内串行以尊重限流），与已有池合并 |
 | `Ranker` | 三级去重 → OpenAlex 补引用数 → 综合打分排序 → 对 Top-N 拉全文 |
 | `Extractor` | 分批（5 篇/次）抽取「方法/结论/数据集/指标」，绑定 `paper_id` |
 | `Clusterer` | embedding + KMeans 分簇 → LLM 起小节标题 → 分配引用编号 |
@@ -150,7 +160,7 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 |------|------|------|
 | `LLM_PROVIDER` | `deepseek` | `deepseek` / `openai` / `ollama` / `stub` |
 | `CONTACT_EMAIL` | — | **建议填真实邮箱**，学术 API 据此给更高配额 |
-| `ENABLED_SOURCES` | `arxiv,openalex` | 可加 `semantic_scholar` |
+| `ENABLED_SOURCES` | `arxiv,openalex` | 可选 `semantic_scholar` / `pubmed` / `crossref`，逗号分隔 |
 | `TARGET_PAPER_COUNT` | `40` | 文献池目标规模，不足触发内环 |
 | `TOP_N_FULLTEXT` | `8` | 下载全文的篇数，`0` 或 `ENABLE_FULLTEXT=false` 为纯摘要模式 |
 | `N_CLUSTERS` | `0` | 主题簇数，`0` = 自动推断 |
@@ -176,7 +186,7 @@ Ollama 走本地 OpenAI 兼容端点，无需 key，但不启用 JSON mode（靠
 python -m src.main <主题> [选项]
 
 检索：
-  --sources arxiv,openalex      启用的检索源
+  --sources arxiv,openalex,pubmed,crossref   启用的检索源
   -n, --target 40               文献池目标规模
   --per-query 25                单条检索式单源最大返回条数
   --min-year 2020               只保留该年份及之后的文献
@@ -236,7 +246,43 @@ graph.invoke(Command(resume="approve"), config)
 
 ---
 
-## 项目结构
+## HTTP 服务（FastAPI）
+
+把综述能力包成 HTTP 服务（设计文档 §3：CLI / FastAPI 入口），便于嵌进其它系统或做 Web 前端。
+
+```bash
+pip install -e ".[api]"                       # 安装 fastapi / uvicorn / pydantic
+uvicorn src.api:app --host 0.0.0.0 --port 8000
+```
+
+```bash
+# 健康检查
+curl http://localhost:8000/healthz
+
+# 发起一次综述
+curl -X POST http://localhost:8000/review \
+     -H "Content-Type: application/json" \
+     -d '{"topic": "diffusion models for image super-resolution",
+          "sources": "arxiv,openalex,pubmed,crossref", "lang": "en"}'
+```
+
+返回 `{topic, paper_count, citation_count, section_count, gaps, artifacts}`，`artifacts` 给出生成的 `md` / `bib` / `json` 绝对路径。API 模式默认 `with_human=False`；若 LLM 未配 key 返回 400，未生成成稿返回 422/500 并带原因。
+
+---
+
+## 可观测（LangSmith）
+
+设置以下环境变量即开启 LangSmith 轨迹上报（langgraph 在有 key 时自动记录每步 token / 工具调用 / 轨迹），无需改代码：
+
+```bash
+LANGSMITH_API_KEY=ls-...          # 必填，填了才开启追踪
+LANGSMITH_PROJECT=lit-review-agent  # 可选，项目名
+LANGSMITH_TRACING=true            # 可选，提供 key 时默认即开
+```
+
+`src/config.py` 的 `apply_langsmith_env()` 会在加载配置时把这些值透传为标准 `LANGCHAIN_*` 环境变量。
+
+---
 
 ```
 lit-review-agent/
@@ -247,21 +293,23 @@ lit-review-agent/
 │   │   ├── nodes.py        # 10 个节点实现
 │   │   ├── tools.py        # 多源检索、去重、排序、全文获取
 │   │   ├── prompts.py      # 各节点提示词
-│   │   └── llm.py          # 统一 LLM 调用 + JSON 容错 + stub 后端
+│   │   └── llm.py          # 统一 LLM 调用 + JSON 容错 + 429 退避 + stub 后端
 │   ├── ingest/
 │   │   ├── base.py         # Paper 结构、限流器、礼貌 HTTP
 │   │   ├── arxiv_client.py
 │   │   ├── openalex.py     # 含摘要倒排索引还原、引用数补全
 │   │   ├── semantic_scholar.py
+│   │   ├── pubmed.py       # NCBI E-utilities：PubMed/PMC 检索 + PMC OA 全文
+│   │   ├── crossref.py     # DOI 元数据 + 被引数（出版社页靠 Unpaywall 兜底）
 │   │   ├── unpaywall.py    # 按 DOI 兜底找 OA
 │   │   ├── downloader.py   # OA 解析 + PDF 下载 + license sidecar
 │   │   └── pdf_parser.py   # pypdf 抽取 + 头尾压缩
 │   ├── cluster/theme_cluster.py
 │   ├── report/bibtex.py
 │   ├── config.py
-│   └── main.py
-├── tests/                  # 64 个测试，默认不联网（含 embedding 路径与 HITL 续跑）
-├── .github/workflows/test.yml
+│   ├── main.py             # CLI 入口
+│   └── api.py              # FastAPI 入口（可选依赖 [api]）
+├── tests/                  # 66 个离线测试，默认不联网（含 embedding 路径、HITL 续跑、PubMed/Crossref）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -272,21 +320,22 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 64 个离线测试，约 5s
-pytest -m network           # 2 个联网测试，真打 arXiv / OpenAlex
+pytest -m "not network"     # 66 个离线测试，约 5s
+pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑**。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑**、**LLM 429 退避重试**。
 
 ---
 
 ## 可选依赖
 
 ```bash
-pip install -e ".[all]"      # embed + persist + dev，开箱即用（推荐）
+pip install -e ".[all]"      # embed + persist + dev + api，开箱即用（推荐）
 # 或按需单独装：
 pip install -e ".[embed]"     # sentence-transformers，语义聚类效果更好（默认已启用）
 pip install -e ".[persist]"   # SQLite 检查点，断点续跑（--human 需要）
+pip install -e ".[api]"       # FastAPI / uvicorn / pydantic，提供 HTTP 入口
 pip install grandalf          # --print-graph 显示 ASCII 图
 ```
 
@@ -307,6 +356,11 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] 全文 PDF 解析、Critic 外环、BibTeX、Human-in-the-loop
 - [x] P0 质量改进：相关性闸门 + 混合排序、全文真正落地、元数据清洗
 - [x] P1 能力补全：Human-in-the-loop 真正可续跑（SQLite 检查点 + `Command(resume)`）、embedding 聚类启用
-- [ ] 向量库持久化文献池（chromadb / faiss），跨主题复用
-- [ ] LaTeX 模板输出
-- [ ] LangSmith 轨迹面板与成本统计
+- [x] P2 检索源扩展：PubMed/PMC + Crossref 检索器，默认白名单放行
+- [x] P2 可靠性：LLM 客户端 429 指数退避重试
+- [x] P2 服务化：FastAPI HTTP 入口（`src/api.py`）
+- [x] P2 可观测：LangSmith 环境变量接线（有 key 自动开启轨迹）
+- [x] P2 文档与示例：README Mermaid 图 + `output/deformable_mirror_*` 示例、真 LLM 测试脚手架（有 key 时运行）
+- [ ] 向量库持久化文献池（chromadb / faiss），跨主题复用（架构改动较大，单列）
+- [ ] LaTeX 模板输出（设计列入，未实现）
+- [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
