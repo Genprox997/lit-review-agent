@@ -219,6 +219,29 @@ class StubBackend:
         )
 
     @staticmethod
+    def _parse_human_feedback(user: str) -> str:
+        """桩：把第一条小节改写为「按用户意见改写本节」。"""
+        titles = re.findall(r"^- (.+)$", user, flags=re.MULTILINE)
+        feedback = ""
+        m = re.search(r"用户修改意见：\s*(.+)", user, flags=re.DOTALL)
+        if m:
+            feedback = m.group(1).strip().splitlines()[0]
+        target = {
+            "action": "rewrite",
+            "section": titles[0] if titles else "",
+            "instruction": feedback or "根据用户意见改写本节",
+        }
+        return json.dumps({"targets": [target]}, ensure_ascii=False)
+
+    @staticmethod
+    def _faithfulness(user: str) -> str:
+        """桩：默认所有证据都支撑论断。"""
+        return json.dumps(
+            {"verdict": "supported", "reason": "[stub] 证据与论断一致。"},
+            ensure_ascii=False,
+        )
+
+    @staticmethod
     def _synthesizer(user: str) -> str:
         cite = (re.findall(r"\[(\d+)\]", user) or ["1"])[0]
         if "撰写摘要与引言" in user:

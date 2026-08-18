@@ -77,11 +77,17 @@ class AgentState(TypedDict, total=False):
     gaps: List[str]
     trends: List[str]
     grounded_claims: Annotated[List[Dict[str, Any]], operator.add]  # Claim 级证据锚定（P3-2）
+    faithfulness: Dict[str, Any]                # 引用-论断一致性校验（faithfulness，方向 B）
 
     # ---- 输出 ----
     report: str                                 # 最终 Markdown 成稿
     bibtex: str                                 # BibTeX 内容
     artifacts: Dict[str, str]                   # 产物文件路径
+
+    # ---- Human-in-the-loop 闭环改写（方向 A）----
+    human_feedback: str                         # 人工审核意见（非空表示需要 targeted rewrite）
+    rewrite_targets: List[Dict[str, Any]]       # 解析后的改写动作列表
+    human_round: int                            # 已完成的 targeted 改写轮次
 
     # ---- 控制 ----
     retrieval_round: int                        # 内环：检索轮次
@@ -106,9 +112,13 @@ def initial_state(topic: str, constraints: str = "") -> AgentState:
         "gaps": [],
         "trends": [],
         "grounded_claims": [],
+        "faithfulness": {},
         "report": "",
         "bibtex": "",
         "artifacts": {},
+        "human_feedback": "",
+        "rewrite_targets": [],
+        "human_round": 0,
         "retrieval_round": 0,
         "critic_round": 0,
         "logs": [],

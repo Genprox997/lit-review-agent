@@ -304,9 +304,12 @@ def clusterer(state: AgentState) -> dict:
         used_labels.add(raw)
         c.label = raw
 
-    # --- 引用编号：按簇顺序、簇内按得分降序 ---
-    citation_map: Dict[str, int] = {}
-    counter = 1
+    # --- 引用编号：跨轮次稳定（方向 A）---
+    # 保留上一轮已分配的编号，仅对新出现的论文追加，避免 Critic 打回重聚类后
+    # 用户看到的 [n] 指向完全不同的论文。
+    existing_map = dict(state.get("citation_map") or {})
+    citation_map: Dict[str, int] = dict(existing_map)
+    counter = (max(existing_map.values()) if existing_map else 0) + 1
     for c in clusters:
         ordered = sorted(
             (pid for pid in c.paper_ids if pid in by_id),
@@ -813,8 +816,12 @@ def human_review(state: AgentState) -> dict:
     """人工审核节点（Human-in-the-loop）。
 
     图运行到此处时调用 `interrupt()` 挂起：把草稿路径交给调用方，等待其用
-    `Command(resume=feedback)` 续跑。feedback 为空或近似 'approve' 视为通过；
-    否则把人工意见写入日志留痕（当前版本不自动重生成，留待后续回环增强）。
+    `Command(resume=feedback)` 续跑。
+
+    - feedback 为空或近似 'approve' 视为通过：清除 `human_feedback` 并定稿；
+    - 否则保留意见到 `human_feedback`，由 `route_after_human` 路由到
+      `parse_human_feedback` → `rewrite_sections` 做**针对性重生成**（方向 A），
+      而非整篇重来。重生成后再回到本节点等待下一轮审核（受 `max_human_rounds` 上限约束）。
     """
     artifacts = state.get("artifacts") or {}
     report_path = artifacts.get("report")
@@ -830,9 +837,149 @@ def human_review(state: AgentState) -> dict:
             "human_feedback": feedback,
             "logs": [_log(f"Human: 收到审核意见 → {feedback[:200]}")],
         }
-    return {"logs": [_log("Human: 审核通过，定稿")]}
+    # 通过：清除可能的旧意见，确保 route_after_human 不会误判为需要改写
+    return {"human_feedback": "", "logs": [_log("Human: 审核通过，定稿")]}
 
 
 def skip_human_review(state: AgentState) -> dict:
     """未启用 --human 时的占位节点：直接放行，不挂起（避免无谓中断）。"""
     return {"logs": [_log("Human: 未启用人工审核，跳过")]}
+
+
+# ==========================================================================
+# 10.5 ParseHumanFeedback —— 把人工意见解析成 targeted 改写动作（方向 A）
+# ==========================================================================
+def parse_human_feedback(state: AgentState) -> dict:
+    """把 `human_feedback` 的自由文本解析为针对现有小节的 rewrite / add 动作列表。
+
+    解析结果写入 `rewrite_targets`，供 `rewrite_sections` 只重跑受影响的小节。
+    """
+    feedback = (state.get("human_feedback") or "").strip()
+    sections = state.get("sections") or {}
+    titles = "\n".join(f"- {t}" for t in sections) or "- （无）"
+    user = P.PARSE_HUMAN_FEEDBACK_USER.format(
+        sections=titles,
+        feedback=feedback or "（未提供具体意见）",
+    )
+    data = chat_json(
+        "parse_human_feedback",
+        P.PARSE_HUMAN_FEEDBACK_SYSTEM,
+        user,
+        default={},
+    ) or {}
+
+    targets: List[Dict[str, Any]] = []
+    for t in (data.get("targets") or []):
+        action = str(t.get("action", "rewrite")).lower()
+        if action not in ("rewrite", "add"):
+            action = "rewrite"
+        title = str(t.get("section", "")).strip()
+        instr = str(t.get("instruction", "")).strip()
+        if title or instr:
+            targets.append({"action": action, "section": title, "instruction": instr})
+
+    summary = [t.get("section") or "(新增)" for t in targets] or ["（无）"]
+    return {
+        "rewrite_targets": targets,
+        "logs": [_log(f"ParseHumanFeedback: 解析出 {len(targets)} 条修改动作 → {summary}")],
+    }
+
+
+# ==========================================================================
+# 10.6 RewriteSections —— 仅重跑受影响小节（方向 A，闭环重生成核心）
+# ==========================================================================
+def _best_cluster_match(query: str, clusters: List[Dict[str, Any]]):
+    """按关键词重叠为改写动作匹配最相关的主题簇（用于 add 或标题模糊匹配）。"""
+    if not query or not clusters:
+        return None
+    q = set(re.findall(r"[A-Za-z\u4e00-\u9fff]+", (query or "").lower()))
+    if not q:
+        return None
+    best, best_score = None, 0
+    for c in clusters:
+        text = (c.get("label", "") + " " + " ".join(c.get("keywords") or [])).lower()
+        words = set(re.findall(r"[A-Za-z\u4e00-\u9fff]+", text))
+        score = len(q & words)
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
+def _generate_section(
+    topic: str,
+    title: str,
+    cluster: Dict[str, Any],
+    instruction: str,
+    by_id: Dict[str, dict],
+    ev_by_id: Dict[str, Evidence],
+    citation_map: Dict[str, int],
+) -> str:
+    """基于某个主题簇的证据，按人工意见重写一篇小节（复用 section_writer 提示词）。"""
+    pids = cluster["paper_ids"]
+    allowed = [citation_map[pid] for pid in pids[:MAX_EVIDENCE_PER_SECTION] if pid in citation_map]
+    if not allowed:
+        return ""
+    user = P.SECTION_WRITER_USER.format(
+        topic=topic,
+        section_title=title,
+        keywords=", ".join(cluster.get("keywords") or []) or "（无）",
+        allowed_citations=", ".join(f"[{n}]" for n in allowed),
+        evidence_block=_evidence_block(pids, by_id, ev_by_id, citation_map),
+    )
+    if instruction:
+        user += f"\n\n【人工修改意见】请特别回应以下意见：{instruction}"
+    text = chat(
+        "section_writer",
+        P.SECTION_WRITER_SYSTEM.format(lang_hint=_lang_hint()),
+        user,
+    ).strip()
+    return _strip_invalid_citations(text, set(allowed)) if text else ""
+
+
+def rewrite_sections(state: AgentState) -> dict:
+    """按 `rewrite_targets` 只重跑受影响的小节，并回写 `sections`。
+
+    改写后清掉 `human_feedback`，避免下一轮 approve 被误判为仍需改写；
+    同时递增 `human_round` 供 `route_after_human` 做轮次上限控制。
+    """
+    targets = state.get("rewrite_targets") or []
+    sections: Dict[str, str] = dict(state.get("sections") or {})
+    clusters = state.get("clusters") or []
+    papers = state.get("papers") or []
+    by_id = {p["paper_id"]: p for p in papers}
+    ev_by_id = {e["paper_id"]: e for e in (state.get("evidence") or [])}
+    citation_map = state.get("citation_map") or {}
+    cluster_by_label = {c["label"]: c for c in clusters}
+    human_round = int(state.get("human_round", 0)) + 1
+
+    for tgt in targets:
+        action = (tgt.get("action") or "rewrite").lower()
+        title = (tgt.get("section") or "").strip()
+        instr = (tgt.get("instruction") or "").strip()
+        cluster = cluster_by_label.get(title) or _best_cluster_match(title or instr, clusters)
+
+        if action == "add" or cluster is None:
+            cluster = cluster or _best_cluster_match(instr, clusters) or (clusters[0] if clusters else None)
+            if cluster is None:
+                continue  # 无任何簇可生成，跳过该动作
+            new_title = title or cluster["label"]
+            sections[new_title] = _generate_section(
+                state["topic"], new_title, cluster, instr, by_id, ev_by_id, citation_map
+            )
+        else:
+            sections[title] = _generate_section(
+                state["topic"], title, cluster, instr, by_id, ev_by_id, citation_map
+            )
+
+    return {
+        "sections": sections,
+        "human_round": human_round,
+        "rewrite_targets": [],
+        "human_feedback": "",  # 清除，避免下一轮 approve 误判
+        "logs": [
+            _log(
+                f"RewriteSections: 按人工意见改写 {len(targets)} 个小节（第 {human_round} 轮，"
+                f"当前小节数 {len(sections)}）"
+            )
+        ],
+    }

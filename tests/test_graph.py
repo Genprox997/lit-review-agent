@@ -7,11 +7,17 @@ import os
 import pytest
 
 from src.agent import nodes as N
-from src.agent.graph import build_graph, route_after_critic, route_after_retrieval
+from src.agent.graph import (
+    build_graph,
+    route_after_critic,
+    route_after_human,
+    route_after_retrieval,
+)
 from src.agent.llm import parse_json
 from src.agent.state import initial_state
 from src.ingest.base import make_paper
 from src.config import get_settings
+from langgraph.graph import END
 
 import src.cluster.theme_cluster as TC
 
@@ -322,3 +328,107 @@ def test_critic_loop_triggers_second_retrieval(stub_env, offline_retrieval, monk
     assert final["critic_round"] == 2
     assert "cross modal alignment" in final["queries"]
     assert final["report"]
+
+
+# --------------------------------------------------------------------------
+# 方向 A：引用编号跨轮次稳定
+# --------------------------------------------------------------------------
+def test_clusterer_preserves_existing_citation_numbers(stub_env):
+    """Critic 打回重聚类后，旧论文的引用编号应保持不变，新论文仅追加。"""
+    st = initial_state("t")
+    st["papers"] = _fake_pool(12)
+    st["evidence"] = [{"paper_id": p["paper_id"], "claim": "c"} for p in st["papers"]]
+    m1 = dict(N.clusterer(st)["citation_map"])
+
+    new_paper = make_paper(
+        paper_id="arxiv:new.99", title="New method paper", abstract="novel approach benchmark",
+        year=2023, citation_count=10, source="arxiv", authors=["N"], matched_queries=["x"],
+    )
+    st2 = initial_state("t")
+    st2["papers"] = st["papers"] + [new_paper]
+    st2["evidence"] = st["evidence"] + [{"paper_id": "arxiv:new.99", "claim": "c"}]
+    st2["citation_map"] = m1  # 携带上一轮编号
+    m2 = N.clusterer(st2)["citation_map"]
+
+    for pid, num in m1.items():
+        assert m2.get(pid) == num, f"{pid} 的引用编号应跨轮次保持不变"
+    assert m2.get("arxiv:new.99") == max(m1.values()) + 1, "新论文应追加在已用编号之后"
+
+
+# --------------------------------------------------------------------------
+# 方向 A：Human-in-the-loop 闭环改写路由
+# --------------------------------------------------------------------------
+def test_route_after_human_approve_ends(stub_env):
+    assert route_after_human({"human_feedback": "", "human_round": 0}) == END
+    assert route_after_human({"human_feedback": "approve", "human_round": 0}) == END
+
+
+def test_route_after_human_feedback_triggers_rewrite(stub_env):
+    stub_env.max_human_rounds = 2
+    assert route_after_human({"human_feedback": "补充对比实验", "human_round": 0}) == "parse_human_feedback"
+
+
+def test_route_after_human_respects_cap(stub_env):
+    stub_env.max_human_rounds = 2
+    assert route_after_human({"human_feedback": "再改一次", "human_round": 2}) == END
+
+
+def test_parse_human_feedback_produces_targets(stub_env):
+    st = initial_state("t")
+    st["sections"] = {"视觉识别路线": "x", "语言模型路线": "y"}
+    st["human_feedback"] = "请在视觉识别路线补充与对比方法的实验分析"
+    out = N.parse_human_feedback(st)
+    targets = out["rewrite_targets"]
+    assert len(targets) >= 1
+    assert targets[0]["action"] in ("rewrite", "add")
+    assert targets[0]["section"] or targets[0]["instruction"]
+
+
+def test_rewrite_sections_updates_only_target(stub_env):
+    st = initial_state("vision")
+    p1 = make_paper(paper_id="arxiv:1", title="Vision A", abstract="vision recognition",
+                    citation_count=50, year=2020)
+    p2 = make_paper(paper_id="doi:10.1/b", title="Vision B", abstract="vision transformer",
+                    citation_count=80, year=2021)
+    st["papers"] = [p1, p2]
+    st["citation_map"] = {"arxiv:1": 1, "doi:10.1/b": 2}
+    st["evidence"] = [
+        {"paper_id": "arxiv:1", "claim": "CNN 提升识别", "method": "m", "dataset": "d", "metric": "k", "section": ""},
+        {"paper_id": "doi:10.1/b", "claim": "ViT 领先", "method": "m", "dataset": "d", "metric": "k", "section": ""},
+    ]
+    st["clusters"] = [{"cluster_id": 0, "label": "视觉识别路线", "keywords": ["vision"],
+                       "paper_ids": ["arxiv:1", "doi:10.1/b"], "size": 2}]
+    st["sections"] = {"视觉识别路线": "原内容 [1][2]。", "其它小节": "保持不变 [1]。"}
+    st["rewrite_targets"] = [{"action": "rewrite", "section": "视觉识别路线",
+                              "instruction": "补充对比实验"}]
+    out = N.rewrite_sections(st)
+    assert out["human_round"] == 1
+    assert out["human_feedback"] == ""  # 改写后清除，避免误判
+    assert "视觉识别路线" in out["sections"]
+    # 非目标小节内容不变
+    assert out["sections"]["其它小节"] == "保持不变 [1]。"
+
+
+def test_human_targeted_rewrite_loop(stub_env, offline_retrieval):
+    """--human 挂起后，带意见续跑应触发 parse→rewrite→...→再次挂起（闭环重生成）。"""
+    from src.agent.graph import run_review
+
+    stub_env.target_paper_count = 10
+    stub_env.max_retrieval_rounds = 1
+    stub_env.max_human_rounds = 2
+    tid = "rewrite-e2e"
+
+    first = run_review("a test topic", thread_id=tid, with_human=True, stream=False)
+    assert first.get("interrupted"), "首次运行应挂起"
+    first_sections = dict(first.get("sections", {}))
+
+    second = run_review(
+        "a test topic", thread_id=tid, with_human=True,
+        feedback="请在第 1 个主题小节补充与对比方法的实验分析", stream=False,
+    )
+    assert second.get("interrupted"), "改写后应再次挂起等待下一轮审核"
+    assert second.get("human_round", 0) == 1, "应完成 1 轮 targeted 改写"
+    assert any("RewriteSections" in log for log in second.get("logs", [])), "应记录改写节点"
+    assert len(second.get("sections", {})) == len(first_sections), "小节数应保持一致"
+    for path in second.get("artifacts", {}).values():
+        assert os.path.exists(path), f"产物缺失: {path}"

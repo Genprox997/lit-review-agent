@@ -28,9 +28,11 @@ from src.agent.nodes import (
     gap_analyzer,
     ground_claims,
     human_review,
+    parse_human_feedback,
     query_expander,
     ranker,
     retriever,
+    rewrite_sections,
     section_writer,
     skip_human_review,
     synthesizer,
@@ -77,6 +79,22 @@ def route_after_critic(state: AgentState) -> str:
     return "gap_analyzer"
 
 
+def route_after_human(state: AgentState) -> str:
+    """人工审核后的路由（方向 A）。
+
+    - 收到非空 `human_feedback`（且非 approve 类词）且未超 `max_human_rounds`
+      → 进入 targeted 改写回环；
+    - 否则（通过 / 已达改写上限）→ 结束。
+    """
+    settings = get_settings()
+    feedback = str(state.get("human_feedback") or "").strip().lower()
+    approve_words = {"", "approve", "ok", "yes", "通过", "y", "true"}
+    if feedback not in approve_words and state.get("human_round", 0) < settings.max_human_rounds:
+        logger.info("HITL 回环：收到修改意见，第 %d 轮 targeted 改写", state.get("human_round", 0) + 1)
+        return "parse_human_feedback"
+    return END
+
+
 # ==========================================================================
 # 构图
 # ==========================================================================
@@ -104,6 +122,9 @@ def build_graph(
     builder.add_node("synthesizer", synthesizer)
     # 仅在启用 --human 时挂起等待审核；否则用占位节点直接放行（避免无谓中断）
     builder.add_node("human_review", human_review if with_human else skip_human_review)
+    # 方向 A：人工意见解析 + 针对性重写（仅在收到意见时由 route_after_human 触发）
+    builder.add_node("parse_human_feedback", parse_human_feedback)
+    builder.add_node("rewrite_sections", rewrite_sections)
 
     builder.add_edge(START, "query_expander")
     builder.add_edge("query_expander", "retriever")
@@ -130,7 +151,13 @@ def build_graph(
 
     builder.add_edge("gap_analyzer", "synthesizer")
     builder.add_edge("synthesizer", "human_review")
-    builder.add_edge("human_review", END)
+    builder.add_conditional_edges(
+        "human_review",
+        route_after_human,
+        {"parse_human_feedback": "parse_human_feedback", END: END},
+    )
+    builder.add_edge("parse_human_feedback", "rewrite_sections")
+    builder.add_edge("rewrite_sections", "ground_claims")
 
     if checkpointer is None:
         checkpointer = _default_checkpointer(with_human=with_human)

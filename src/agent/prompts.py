@@ -269,3 +269,55 @@ GROUND_CLAIMS_USER = """本小节标题：{section_title}
 {evidence_block}
 
 请把该小节中的核心论断逐条拆解为 claim + 支撑论文 + 证据强度（JSON）。"""
+
+
+# ==========================================================================
+# 9. ParseHumanFeedback —— 把人工审核意见解析成 targeted 改写动作（方向 A）
+# ==========================================================================
+PARSE_HUMAN_FEEDBACK_SYSTEM = """你是人工审核意见解析器。把用户给出的一段自由修改意见，
+拆解成针对现有综述小节的具体「改写 / 新增」动作，便于自动做 targeted rewrite。
+
+现有小节标题列表（只能针对这些标题做 rewrite，或用 add 新增）：
+{sections}
+
+规则：
+1. 每条意见映射为一个动作：
+   - action="rewrite"：改写某个已有小节（section 必须是列表中出现的标题，或语义最相近的标题）；
+   - action="add"：新增一个小节（section 为新标题，可不在列表中）。
+2. instruction：对该动作的具体要求，如「补充与 X 方法的对比实验」「增加近三年的工作」。
+3. 若意见笼统（如「整体再丰富一些」），拆成对每个相关小节的 rewrite。
+4. 若意见仅在肯定/通过（如「很好」「approve」），返回空 targets。
+
+只输出如下 JSON：
+{{"targets": [{{"action": "rewrite"|"add", "section": "...", "instruction": "..."}}]}}"""
+
+PARSE_HUMAN_FEEDBACK_USER = """现有小节标题：
+{sections}
+
+用户修改意见：
+{feedback}
+
+请解析出具体的改写动作（JSON）。"""
+
+
+# ==========================================================================
+# 10. Faithfulness —— 引用-论断一致性校验（方向 B，LLM-as-Judge）
+# ==========================================================================
+FAITHFULNESS_SYSTEM = """你是引用-论断一致性审计员（LLM-as-Judge）。给定一条综述中的核心论断，
+以及支撑它的若干论文证据，判断这些证据是否真正支持该论断。
+
+判定规则：
+- verdict="supported"：证据（某篇论文的结论/方法/数据）确实支撑该论断；
+- verdict="partial"：证据部分相关但不足以完整支撑（如仅略提及、或证据间接）；
+- verdict="unsupported"：给定证据与该论断不符、无关，或证据为空（论证据充分程度给）。
+- reason：一句话说明判定依据（中/英均可，简洁）。
+
+只输出如下 JSON：
+{{"verdict": "supported"|"partial"|"unsupported", "reason": "..."}}"""
+
+FAITHFULNESS_USER = """待校验论断：{claim}
+
+支撑该论断的论文证据（编号对应文末参考文献）：
+{evidence_block}
+
+请判断这些证据是否真正支持该论断（JSON）。"""

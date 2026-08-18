@@ -87,6 +87,9 @@ class Settings:
     n_clusters: int = field(default_factory=lambda: _env_int("N_CLUSTERS", 0))
     min_year: int = field(default_factory=lambda: _env_int("MIN_YEAR", 0))
 
+    # ---- Human-in-the-loop 闭环改写上限（方向 A）----
+    max_human_rounds: int = field(default_factory=lambda: _env_int("MAX_HUMAN_ROUNDS", 2))
+
     # ---- 相关性闸门与排序（P0-1）----
     relevance_gate: float = field(
         default_factory=lambda: _env_float("RELEVANCE_GATE", 0.10)
@@ -112,6 +115,11 @@ class Settings:
     cache_dir: Path = field(default_factory=lambda: PROJECT_ROOT / _env("CACHE_DIR", ".cache"))
     report_language: str = field(default_factory=lambda: _env("REPORT_LANGUAGE", "zh").lower())
     enable_fulltext: bool = field(default_factory=lambda: _env_bool("ENABLE_FULLTEXT", True))
+    output_format: str = field(
+        default_factory=lambda: _env("OUTPUT_FORMAT", "md").lower()
+    )
+    # faithfulness 自动评测开关（方向 B），默认开启
+    enable_faithfulness: bool = field(default_factory=lambda: _env_bool("ENABLE_FAITHFULNESS", True))
 
     # ---- 持久化 ----
     checkpoint_backend: str = field(default_factory=lambda: _env("CHECKPOINT_BACKEND", "memory").lower())
