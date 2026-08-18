@@ -33,7 +33,8 @@ python -m src.main "retrieval augmented generation"
 | `*_references.bib` | BibTeX，可直接进 LaTeX |
 | `*_review.tex` | 可编译 LaTeX 成稿（`--format latex`；`[n]` 转为 `\cite{key}`，配合同目录 `.bib`） |
 | `*_review.docx` | Word 成稿（`--format docx`，需 `pip install -e ".[docx]"`） |
-| `*_papers.json` | 完整文献池元数据（含得分、引用编号），便于人工复核 |
+| `*_papers.json` | 完整文献池元数据（含得分、引用编号、引用网络中心度），便于人工复核 |
+| `*_meta.json` | 成稿侧车（方向 B'）：本版各小节正文与主题簇，供下一版增量更新沿用编号与保留旧小节 |
 
 ### 示例输出
 
@@ -54,10 +55,11 @@ flowchart TD
     START([START]) --> QE[QueryExpander 扩词<br/>生成多组检索式]
     QE --> R[Retriever 检索<br/>arXiv / OpenAlex / S2 / PubMed / Crossref]
     R -->|数量不足| R
-    R --> RK[Ranker 去重排序<br/>相关性+引用+新颖度]
+    R --> RK[Ranker 去重排序<br/>相关性+引用+新颖度+枢纽度]
     RK --> EX[Extractor 解析<br/>抽取方法/结论/数据/指标]
     EX --> CL[Clusterer 聚类<br/>embedding + KMeans]
-    CL --> SW[SectionWriter 撰写<br/>分主题带引用段落]
+    CL --> IP[IncrementalPlan 增量规划<br/>沿用上一版未变小节]
+    IP --> SW[SectionWriter 撰写<br/>分主题带引用段落]
     SW --> GC[GroundClaims 证据锚定]
     GC --> FA[Faithfulness 一致性校验<br/>LLM-as-Judge]
     FA --> CR[Critic 评审<br/>覆盖度/矛盾检查]
@@ -84,9 +86,10 @@ flowchart TD
 |------|------|
 | `QueryExpander` | 主题 → 5-8 条英文检索式（同义词/方法名/数据集/评测/交叉领域）；打回时只生成补缺口的新检索式 |
 | `Retriever` | 并发打多源 API（arXiv / OpenAlex / S2 / PubMed / Crossref，源间并行、源内串行以尊重限流），与已有池合并 |
-| `Ranker` | 三级去重 → OpenAlex 补引用数 → 综合打分排序 → 对 Top-N 拉全文 |
+| `Ranker` | 三级去重 → OpenAlex 补引用数 → 综合打分排序（含引用网络枢纽度信号，方向 D'）→ 对 Top-N 拉全文 |
 | `Extractor` | 分批（5 篇/次）抽取「方法/结论/数据集/指标」，绑定 `paper_id`；各批并发（P3-4） |
 | `Clusterer` | embedding + KMeans 分簇 → LLM 起小节标题 → 分配引用编号 |
+| `IncrementalPlan` | 增量模式下对比本版与上一版主题簇，重叠≥50% 的小节沿用旧正文、其余标记重写，统计新增/重写/保留（方向 B'）；非增量模式直接放行 |
 | `SectionWriter` | 每簇生成 300-600 字带 `[n]` 内联引用的段落；各簇并发（P3-4） |
 | `Critic` | 检查覆盖度/矛盾处理/证据密度/结构，判 `pass` 或 `need_more` |
 | `GapAnalyzer` | 结合年份分布与簇分布，识别研究空白与演进趋势 |
@@ -114,9 +117,12 @@ score = 0.55 × 相关性(TF-IDF 余弦)
       + 0.20 × 引用数(log 归一化)
       + 0.15 × 新颖度(年份归一化)
       + 0.10 × 检索式覆盖度(被几条检索式同时命中)
+      + 0.10 × 引用网络枢纽度(PageRank，方向 D')
 ```
 
 相关性占主导，是为了**不让高被引但跑题的论文绑架排序**（综述最常见的质量雷：像 Pascal VOC Challenge 这类被引近 2 万的跨主题论文混进候选池）。
+
+**方向 D' 额外引入引用网络枢纽度（PageRank）作为第 5 路信号**（权重 `CITATION_HUB_WEIGHT`，默认 0.10）：枢纽度高的论文（被大量同池论文引用）权重提升，让必引文献更易进入候选，同时缓解「高被引但主题跑偏」的论文绑架排序；无引用数据时该项恒为 0，等价旧行为。详见下方「设计要点 9」。
 
 **相关性闸门（P0-1）**：排序前先用 TF-IDF 余弦相似度算每篇与主题的相关性，低于 `RELEVANCE_GATE`（默认 0.10）的直接剔除出候选池，从源头阻止跑题文献进入聚类与撰写。闸门有自适应保底——若剔除过多导致文献池塌缩（< `MIN_POOL_AFTER_GATE`，默认 20），则按相关性降序保底保留前 N 篇。被剔除的论文标题记录在成稿附录 A.5，方便人工审计。
 
@@ -166,6 +172,27 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 - **LLM 并发**：`Extractor`（按 5 篇一批）、`SectionWriter`（按主题簇）、`GroundClaims`（按小节）里的 LLM 调用彼此独立，用线程池（`chat_json_many` / `chat_many`，并发度 `LLM_MAX_WORKERS`，默认 4）并行执行，端到端时延近似从「Σ 单条」降到「最慢单条」。stub 模式自动串行（无并发意义，且保证离线测试可预测）。
 - **检索 HTTP 磁盘缓存**：所有学术 API 的 GET 响应（2xx）按 `url+params+source` 哈希落盘到 `.cache/http/`，命中且未过期（默认 7 天）时直接复用、跳过网络——跨运行省配额、断网可复现；失败响应（429/5xx）不缓存，过期自动回源。流式下载（PDF）不走缓存。
 
+### 9. 引用网络分析（方向 D'）
+
+高被引 ≠ 必引。综述最容易漏掉的是「主题内必引但被引不一定最高」的关键文献，以及「跨子领域枢纽」论文。方向 D' 用 OpenAlex 的 `referenced_works` 在**本地文献池**内构建有向引用图，算两类中心度（纯 Python 确定性算法，不依赖 networkx）：
+
+- **枢纽度（PageRank）**：被大量同池论文引用的论文得分高，识别「必引候选」；
+- **桥接度（betweenness）**：处于不同子领域引用路径上的论文得分高，识别「跨子领域枢纽」；
+- 无引用数据（池内无 `referenced_works`）时两者全部置 0，安全降级，不报错。
+
+枢纽度作为排序第 5 路信号（见「设计要点 2」）。此外，`GapAnalyzer` 用**共引**找空白：把共享 ≥2 篇参考文献的论文用并查集聚成子领域，未被现有主题簇覆盖者标为研究空白候选，与 LLM 识别的 gaps 合并去重。成稿**附录 A.8「引用网络分析」**列出枢纽度 Top / 桥接度 Top 与「被相关性闸门剔除的高枢纽论文」告警，让关键文献识别与可能的误删可复核。
+
+### 10. 增量更新已有综述（方向 B'）
+
+定期更新某主题综述时，没必要每次从零重跑。方向 B' 让 agent 接住上一版成稿做增量更新：
+
+- **载入历史池 + 沿用编号**：从上一版成稿 `base_path` 的 `<stem>_papers.json` 还原文献池并入检索 seed，同时把上一版 `citation_index` 重建为 `citation_map` 并入本轮，**历史引用编号跨版本延续**，不会因重跑而漂移；
+- **只新检索新文献**：仅拉取 `since_date` 之后（或 `INCREMENTAL_DEFAULT_DAYS` 默认回看窗口内）的论文，旧文献直接复用，省 LLM 与检索配额；
+- **`IncrementalPlan` 节点**：把本版主题簇与上一版按论文重叠度匹配，重叠 ≥50% 的小节**沿用上一版正文**（跳过重新生成），其余标记重写，并统计 `新增 / 重写 / 保留`；
+- **侧车与说明**：`Synthesizer` 写出 `<stem>_meta.json` 侧车（保存本版 `sections` + `clusters`）供下一版沿用；成稿头渲染「增量更新：新增 N 篇，重写 M 个小节，保留 K 个小节（沿用历史引用编号）」。
+
+> 用法：`python -m src.main "topic" --incremental --since 2024-01-01 --base output/上次_review.md`。无 `base_path` 时安全降级为常规生成。
+
 ---
 
 ## 配置
@@ -191,6 +218,8 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 | `LLM_MAX_WORKERS` | `4` | LLM 调用并发线程数（P3-4）：Extractor / SectionWriter / GroundClaims 的批量调用并行执行，缩短端到端时延 |
 | `HTTP_CACHE_ENABLED` | `true` | 检索 GET 响应磁盘缓存开关（P3-4）：命中则跳过网络，省学术 API 配额 |
 | `HTTP_CACHE_TTL_DAYS` | `7` | 缓存有效期（天）；过期自动回源重取 |
+| `CITATION_HUB_WEIGHT` | `0.10` | 引用网络枢纽度（PageRank）在综合排序中的权重（方向 D'）；无引用数据时恒为 0 |
+| `INCREMENTAL_DEFAULT_DAYS` | `180` | 增量更新未给 `--since` 时的默认回看窗口（天），仅增量模式生效（方向 B'） |
 
 ### 换 LLM
 
@@ -224,6 +253,11 @@ python -m src.main <主题> [选项]
   --human                       定稿前挂起等待人工审核（自动启用 SQLite 检查点）
   --resume                      续跑被 --human 挂起的 thread（配合 --thread-id）
   --feedback "意见"             续跑时的人工审核意见（可省略，默认 approve）
+
+增量更新（方向 B'）：
+  --incremental                 增量模式：载入上一版成稿、沿用引用编号、只新检索新文献
+  --since 2024-01-01            增量模式只检索该日期之后的文献（缺省用 INCREMENTAL_DEFAULT_DAYS 回看窗口）
+  --base output/上次_review.md  上一版成稿路径（用于还原文献池与编号）；缺省则安全降级为常规生成
 
 其他：
   -o, --output output/          输出目录
@@ -289,9 +323,16 @@ curl -X POST http://localhost:8000/review \
      -H "Content-Type: application/json" \
      -d '{"topic": "diffusion models for image super-resolution",
           "sources": "arxiv,openalex,pubmed,crossref", "lang": "en"}'
+
+# 增量更新：接住上一版成稿，只新检索新文献、沿用历史编号（方向 B'）
+curl -X POST http://localhost:8000/review \
+     -H "Content-Type: application/json" \
+     -d '{"topic": "diffusion models for image super-resolution",
+          "incremental": true, "since_date": "2024-01-01",
+          "base_path": "output/上次_review.md", "lang": "en"}'
 ```
 
-返回 `{topic, paper_count, citation_count, section_count, gaps, artifacts}`，`artifacts` 给出生成的 `md` / `bib` / `json` 绝对路径。API 模式默认 `with_human=False`；若 LLM 未配 key 返回 400，未生成成稿返回 422/500 并带原因。
+返回 `{topic, paper_count, citation_count, section_count, gaps, artifacts}`，`artifacts` 给出生成的 `md` / `bib` / `json` 绝对路径。API 模式默认 `with_human=False`；若 LLM 未配 key 返回 400，未生成成稿返回 422/500 并带原因。`ReviewRequest` 还支持 `incremental` / `since_date` / `base_path` 三个增量字段（方向 B'），`POST /review` 与 `POST /review/stream` 均接回。
 
 ### 流式 API + 自包含 Web UI（P3-3）
 
@@ -361,7 +402,7 @@ lit-review-agent/
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 100+ 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出）
+├── tests/                  # 114 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -372,11 +413,11 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 100+ 离线测试，约 3 分钟（主要为端到端 stub 流程）
+pytest -m "not network"     # 114 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、faithfulness、多格式输出、引用网络分析、增量更新）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**。
 
 ---
 
@@ -401,7 +442,7 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
 - 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若改用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
-> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）。详见 `CHANGELOG.md`。
+> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成。详见 `CHANGELOG.md`。
 
 ## 路线
 
@@ -421,4 +462,6 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] **方向 A：Human-in-the-loop 闭环重生成 + 引用编号跨轮次稳定**（意见 → targeted rewrite 只重跑受影响小节；Critic 打回后编号不变）
 - [x] **方向 B：引用-论断一致性自动评测（faithfulness，LLM-as-Judge）**（成稿附录 A.7 渲染得分与告警，受 `ENABLE_FAITHFULNESS` 开关）
 - [x] **方向 C：多格式成稿输出**（LaTeX `.tex` 可编译 + Word `.docx`，`--format` / `OUTPUT_FORMAT` 切换）
+- [x] **方向 D'：引用网络分析**（PageRank 枢纽度 / betweenness 桥接度识别必引与跨子领域枢纽；共引找空白；排序加枢纽度信号；附录 A.8）
+- [x] **方向 B'：增量更新已有综述**（载入历史池 + 沿用编号 + 保留未变小节 + 增量说明；CLI `--incremental/--since/--base`，API 同名字段）
 - [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
