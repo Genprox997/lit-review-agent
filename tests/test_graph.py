@@ -447,3 +447,39 @@ def test_faithfulness_appears_in_report(stub_env, offline_retrieval):
     assert "A.7" in report
     assert "一致性得分" in report
     assert final["faithfulness"]["checked"] >= 1
+
+
+# --------------------------------------------------------------------------
+# 方向 C：LaTeX / docx 多格式输出
+# --------------------------------------------------------------------------
+def test_latex_output_generated(stub_env, offline_retrieval, monkeypatch):
+    monkeypatch.setenv("OUTPUT_FORMAT", "latex")
+    get_settings(refresh=True)
+    stub_env.target_paper_count = 10
+    stub_env.max_retrieval_rounds = 1
+    graph = build_graph()
+    final = graph.invoke(
+        initial_state("latex topic"),
+        {"configurable": {"thread_id": "tex-out"}, "recursion_limit": 60},
+    )
+    tex_path = final["artifacts"].get("report_latex")
+    assert tex_path and os.path.exists(tex_path), "应产出 .tex 文件"
+    tex = open(tex_path, encoding="utf-8").read()
+    assert "\\begin{document}" in tex
+    assert "\\cite{" in tex
+    assert "\\bibliography{" in tex
+
+
+def test_docx_output_generated(stub_env, offline_retrieval, monkeypatch):
+    pytest.importorskip("docx")  # 未安装 python-docx 时跳过（[docx] extra）
+    monkeypatch.setenv("OUTPUT_FORMAT", "docx")
+    get_settings(refresh=True)
+    stub_env.target_paper_count = 10
+    stub_env.max_retrieval_rounds = 1
+    graph = build_graph()
+    final = graph.invoke(
+        initial_state("docx topic"),
+        {"configurable": {"thread_id": "docx-out"}, "recursion_limit": 60},
+    )
+    docx_path = final["artifacts"].get("report_docx")
+    assert docx_path and os.path.exists(docx_path), "应产出 .docx 文件"

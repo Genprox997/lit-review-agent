@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     g2.add_argument("--lang", choices=["zh", "en"], help="综述正文语言")
     g2.add_argument("--critic-rounds", type=int, help="Critic 最多打回补文献的轮数（默认 2）")
     g2.add_argument("--human", action="store_true", help="定稿前挂起等待人工审核")
+    g2.add_argument("--format", choices=["md", "latex", "docx"], default=None,
+                    help="成稿格式（默认 md；latex 产出可编译 .tex，docx 产出 Word）")
 
     g3 = p.add_argument_group("其他")
     g3.add_argument("-o", "--output", help="输出目录（默认 output/）")
@@ -86,6 +88,7 @@ def _apply_overrides(args: argparse.Namespace) -> None:
         "REPORT_LANGUAGE": args.lang,
         "MAX_CRITIC_ROUNDS": args.critic_rounds,
         "OUTPUT_DIR": args.output,
+        "OUTPUT_FORMAT": args.format,
     }
     for key, value in mapping.items():
         if value is not None:

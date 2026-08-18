@@ -45,6 +45,7 @@ class ReviewRequest(BaseModel):
     clusters: Optional[int] = Field(None, description="主题簇数量，0=自动")
     lang: Optional[str] = Field(None, description="正文语言：zh / en")
     provider: Optional[str] = Field(None, description="LLM 提供商：deepseek/openai/ollama/stub")
+    format: Optional[str] = Field(None, description="成稿格式：md / latex / docx")
 
 
 def create_app():
@@ -71,6 +72,7 @@ def create_app():
             "N_CLUSTERS": req.clusters,
             "REPORT_LANGUAGE": req.lang,
             "LLM_PROVIDER": req.provider,
+            "OUTPUT_FORMAT": req.format,
         }
         for key, value in overrides.items():
             if value is not None:

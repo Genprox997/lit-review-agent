@@ -47,3 +47,26 @@
 - `tests/test_graph.py`：新增 `test_faithfulness_appears_in_report` 端到端校验。
 
 **验证**：`pytest tests/test_ground.py tests/test_graph.py` 全部通过；完整离线套件 100 passed。
+
+---
+
+## 方向 C：多格式成稿输出（LaTeX + Word/.docx）（2026-08-18）
+
+**目标**：在默认 Markdown + BibTeX 之外，支持直接产出**可编译 LaTeX（`.tex`）**与 **Word（`.docx`）**，覆盖学术投稿与日常汇报两类交付场景（你本人常用 .docx 双格式交付）。
+
+**变更内容**
+- 新增 `_assemble_latex`：与 `_assemble_markdown` 平行，把结构化成稿字段组装为完整 LaTeX 文档；正文 `[n]` 转为 `\cite{key}`（key 取自已写出的 `.bib`），配合同目录 `.bib` 即可 `pdflatex` 编译。
+- 新增 `_write_docx`：用 `python-docx` 写出带标题层级的 `.docx`（惰性导入，未装 `[docx]` extra 时给出清晰安装提示）。
+- `synthesizer` 按 `settings.output_format`（`md` / `latex` / `docx`，默认 `md`）决定是否追加产出对应文件，产物路径写入 `artifacts.report_latex` / `artifacts.report_docx`（Markdown 仍始终产出，作为规范底稿）。
+- CLI 新增 `--format`、FastAPI `ReviewRequest` 新增 `format` 字段，均接回 `OUTPUT_FORMAT` 配置。
+- `pyproject.toml` 新增 `[docx]` extra（含 `python-docx`）。
+
+**涉及文件**
+- `src/agent/nodes.py`：新增 `_assemble_latex` / `_write_docx`；`synthesizer` 格式分支。
+- `src/agent/config.py`：新增 `output_format`（默认 `md`）。
+- `src/main.py`：新增 `--format` 参数与配置接线。
+- `src/api.py`：`ReviewRequest` 新增 `format` 字段与接线。
+- `src/pyproject.toml`：新增 `docx` extra。
+- `tests/test_graph.py`：新增 `test_latex_output_generated` / `test_docx_output_generated`。
+
+**验证**：`pytest tests/test_graph.py` 全部通过（LaTeX 断言 `\begin{document}`/`\cite{`/`\bibliography{`；docx 断言产物存在且可打开）。完整离线套件 102 passed（含 LaTeX + docx 两测试）。
