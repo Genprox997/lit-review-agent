@@ -18,6 +18,7 @@ from langgraph.types import interrupt
 from src.agent import prompts as P
 from src.agent.llm import chat, chat_json, chat_json_many, chat_many
 from src.agent.state import AgentState, Evidence
+from src.agent import citation_graph as CG  # 引用网络分析（方向 D'）
 from src.agent.tools import (
     apply_relevance_gate,
     compute_relevance,
@@ -161,6 +162,12 @@ def ranker(state: AgentState) -> dict:
     if "openalex" in settings.enabled_sources:
         enrich_citations(papers, limit=30)
 
+    # --- 引用网络分析（方向 D'）：PageRank 枢纽度 + 桥接度 ---
+    CG.score_centrality(papers)
+    graph_available = sum(len(p.get("referenced_works") or []) for p in papers) > 0
+    top_hub = sorted(papers, key=lambda p: p.get("hub_score", 0.0), reverse=True)[:5]
+    top_bridge = sorted(papers, key=lambda p: p.get("bridge_score", 0.0), reverse=True)[:5]
+
     # --- 相关性闸门（P0-1）---
     relevance = compute_relevance(papers, state["topic"], queries)
     kept, dropped = apply_relevance_gate(
@@ -174,6 +181,11 @@ def ranker(state: AgentState) -> dict:
         "dropped_titles": dropped[:25],
     }
 
+    dropped_high_hub = [
+        {"title": p.get("title", ""), "hub": round(p.get("hub_score", 0.0), 4)}
+        for p in dropped if (p.get("hub_score") or 0.0) >= 0.6
+    ][:10]
+
     # 排序用闸门幸存者；relevance 已对齐 kept 顺序，避免重复计算
     score_map = {p["paper_id"]: relevance[i] for i, p in enumerate(papers)}
     kept_relevance = [score_map[p["paper_id"]] for p in kept]
@@ -182,10 +194,26 @@ def ranker(state: AgentState) -> dict:
     ]
     n_full = enrich_topn_fulltext(ranked, settings)
 
+    citation_analysis = {
+        "available": graph_available,
+        "top_hub": [
+            {"title": p.get("title", ""), "year": p.get("year"),
+             "hub": round(p.get("hub_score", 0.0), 4), "paper_id": p["paper_id"]}
+            for p in top_hub
+        ],
+        "top_bridge": [
+            {"title": p.get("title", ""), "year": p.get("year"),
+             "bridge": round(p.get("bridge_score", 0.0), 4), "paper_id": p["paper_id"]}
+            for p in top_bridge
+        ],
+        "dropped_high_hub": dropped_high_hub,
+    }
+
     top_preview = " | ".join(f"{p['title'][:38]}({p.get('year')})" for p in ranked[:3])
     return {
         "papers": ranked,
         "relevance_gate": gate_stats,
+        "citation_analysis": citation_analysis,
         "logs": [
             _log(
                 f"Ranker: 相关性闸门移除 {gate_stats['dropped']} 篇偏离主题"
@@ -641,10 +669,22 @@ def gap_analyzer(state: AgentState) -> dict:
 
     gaps = [str(g).strip() for g in (data.get("gaps") or []) if str(g).strip()]
     trends = [str(t).strip() for t in (data.get("trends") or []) if str(t).strip()]
+
+    # 共引分析补充潜在空白（方向 D'）：把共享大量参考文献的论文聚成子领域，
+    # 未被现有主题簇覆盖者标为研究空白候选，与 LLM 识别的 gaps 合并去重。
+    try:
+        cocite_gaps = CG.cocitation_gaps(papers, clusters)
+    except Exception as exc:
+        logger.debug("共引空白分析失败（跳过）: %s", exc)
+        cocite_gaps = []
+    for g in cocite_gaps:
+        if g and g not in gaps:
+            gaps.append(g)
+
     return {
         "gaps": gaps,
         "trends": trends,
-        "logs": [_log(f"GapAnalyzer: {len(gaps)} 条研究空白，{len(trends)} 条趋势")],
+        "logs": [_log(f"GapAnalyzer: {len(gaps)} 条研究空白（含共引 {len(cocite_gaps)} 条），{len(trends)} 条趋势")],
     }
 
 
@@ -906,6 +946,36 @@ def _assemble_markdown(
                 )
         else:
             appendix.append("- 未发现明显无支撑论断。")
+
+    # A.8 引用网络分析（方向 D'）：让关键文献识别与误删告警可复核
+    analysis = state.get("citation_analysis") or {}
+    if analysis.get("available") and (analysis.get("top_hub") or analysis.get("top_bridge")):
+        appendix.append("\n### A.8 引用网络分析\n")
+        appendix.append(
+            "- 基于论文间引用关系计算枢纽度（PageRank）与桥接度（betweenness），"
+            "识别必引候选与跨子领域枢纽，缓解关键流派漏检。"
+        )
+        top_hub = analysis.get("top_hub") or []
+        if top_hub:
+            appendix.append("- 枢纽度 Top（必引候选）：")
+            for h in top_hub:
+                appendix.append(
+                    f"  - {h.get('title', '')} ({h.get('year') or '?'}) — 枢纽度 {h.get('hub')}"
+                )
+        top_bridge = analysis.get("top_bridge") or []
+        if top_bridge:
+            appendix.append("- 桥接度 Top（跨子领域枢纽）：")
+            for b in top_bridge:
+                appendix.append(
+                    f"  - {b.get('title', '')} ({b.get('year') or '?'}) — 桥接度 {b.get('bridge')}"
+                )
+        dropped = analysis.get("dropped_high_hub") or []
+        if dropped:
+            appendix.append(
+                "- 告警：以下被相关性闸门剔除的论文枢纽度较高，建议人工复核是否误删："
+            )
+            for d in dropped:
+                appendix.append(f"  - {d.get('title', '')} — 枢纽度 {d.get('hub')}")
 
     parts.append("\n".join(appendix))
 

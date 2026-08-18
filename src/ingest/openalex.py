@@ -33,6 +33,7 @@ SELECT_FIELDS = ",".join(
         "primary_location",
         "authorships",
         "type",
+        "referenced_works",
     ]
 )
 
@@ -131,6 +132,8 @@ def _parse_work(work: dict, query: str) -> Paper:
         pdf_url=pdf_url,
         doi=doi,
         source="openalex",
+        openalex_id=oa_id,
+        referenced_works=work.get("referenced_works") or [],
         matched_queries=[query],
     )
 

@@ -237,10 +237,12 @@ def rank_papers(
     settings: Optional[Settings] = None,
     relevance: Optional[Sequence[float]] = None,
 ) -> List[Paper]:
-    """综合相关性 + 引用数 + 新颖度 + 检索式覆盖度排序，结果写回 `paper["score"]`。
+    """综合相关性 + 引用数 + 新颖度 + 检索式覆盖度 + 引用枢纽度排序，写回 `paper["score"]`。
 
     相关性权重占主导（默认 0.55），引用数退居次要（默认 0.20），
-    不再让高被引但跑题的论文绑架排序（P0-1）。
+    不再让高被引但跑题的论文绑架排序（P0-1）。方向 D' 新增的 `hub_score`
+    （引用网络 PageRank 枢纽度，默认 0.10）让「被大量论文引用的必引文献」权重提升，
+    缓解关键流派漏检；未提供引用关系数据时 hub_score 恒为 0，等价于旧行为。
     `relevance` 可传入已算好的原始分数（与 papers 对齐），避免重复计算。
     """
     settings = settings or get_settings()
@@ -266,11 +268,15 @@ def rank_papers(
 
     n_queries = max(1, len(set(queries)))
 
+    hubs = [float(p.get("hub_score") or 0.0) for p in papers]
+    max_hub = max(hubs) if hubs else 1.0
+
     w = (
         settings.relevance_weight,
         settings.citation_weight,
         settings.recency_weight,
         settings.coverage_weight,
+        settings.citation_hub_weight,
     )
 
     for i, paper in enumerate(papers):
@@ -279,9 +285,11 @@ def rank_papers(
         recency = (year - y_min) / y_span if years else 0.5
         coverage = min(1.0, len(set(paper.get("matched_queries") or [])) / n_queries)
         rel_norm = (relevance[i] / rel_max) if rel_max > 0 else 0.0
+        hub_norm = (hubs[i] / max_hub) if max_hub > 0 else 0.0
 
         paper["score"] = round(
-            w[0] * rel_norm + w[1] * cite_score + w[2] * recency + w[3] * coverage, 4
+            w[0] * rel_norm + w[1] * cite_score + w[2] * recency
+            + w[3] * coverage + w[4] * hub_norm, 4
         )
 
     papers.sort(key=lambda p: p.get("score", 0.0), reverse=True)

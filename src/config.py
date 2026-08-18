@@ -106,6 +106,9 @@ class Settings:
     coverage_weight: float = field(
         default_factory=lambda: _env_float("COVERAGE_WEIGHT", 0.10)
     )
+    citation_hub_weight: float = field(  # 引用网络枢纽度信号权重（方向 D'）
+        default_factory=lambda: _env_float("CITATION_HUB_WEIGHT", 0.10)
+    )
     min_pool_after_gate: int = field(
         default_factory=lambda: _env_int("MIN_POOL_AFTER_GATE", 20)
     )

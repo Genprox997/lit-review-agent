@@ -33,7 +33,9 @@ class Paper(TypedDict, total=False):
     matched_queries: List[str]
     relevance: float                  # 与主题的相关性（P0-1 闸门使用，0-1）
     has_fulltext: bool                # 是否成功获取 OA 全文（P0-2）
-    fulltext_chars: int               # 全文字符数（持久化用）
+    fulltext_chars: int               # 全文字节数（持久化用）
+    openalex_id: str                  # OpenAlex 作品 ID（方向 D' 引用网络分析）
+    referenced_works: List[str]       # 引用作品 OpenAlex ID 列表（方向 D'）
 
 
 class Evidence(TypedDict, total=False):
@@ -78,6 +80,7 @@ class AgentState(TypedDict, total=False):
     trends: List[str]
     grounded_claims: Annotated[List[Dict[str, Any]], operator.add]  # Claim 级证据锚定（P3-2）
     faithfulness: Dict[str, Any]                # 引用-论断一致性校验（faithfulness，方向 B）
+    citation_analysis: Dict[str, Any]           # 引用网络分析（方向 D'）：枢纽/桥接论文、告警
 
     # ---- 输出 ----
     report: str                                 # 最终 Markdown 成稿
@@ -113,6 +116,7 @@ def initial_state(topic: str, constraints: str = "") -> AgentState:
         "trends": [],
         "grounded_claims": [],
         "faithfulness": {},
+        "citation_analysis": {},
         "report": "",
         "bibtex": "",
         "artifacts": {},

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _PERSIST_FIELDS = (
     "paper_id", "title", "authors", "year", "venue", "citation_count", "abstract",
     "url", "pdf_url", "doi", "source", "score", "matched_queries",
+    "openalex_id", "referenced_works",
 )
 
 
@@ -96,7 +97,8 @@ class PaperStore:
             cached = self.get(p)
             if cached:
                 merged = dict(p)
-                for f in ("citation_count", "abstract", "doi", "pdf_url", "venue", "year"):
+                for f in ("citation_count", "abstract", "doi", "pdf_url", "venue", "year",
+                          "openalex_id", "referenced_works"):
                     if not merged.get(f) and cached.get(f):
                         merged[f] = cached[f]
                 if len(cached.get("authors") or []) > len(merged.get("authors") or []):

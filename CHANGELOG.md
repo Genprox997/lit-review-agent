@@ -70,3 +70,34 @@
 - `tests/test_graph.py`：新增 `test_latex_output_generated` / `test_docx_output_generated`。
 
 **验证**：`pytest tests/test_graph.py` 全部通过（LaTeX 断言 `\begin{document}`/`\cite{`/`\bibliography{`；docx 断言产物存在且可打开）。完整离线套件 102 passed（含 LaTeX + docx 两测试）。
+
+---
+
+## 方向 D'：引用网络分析（必引/桥接论文 + 共引空白）（2026-08-18）
+
+**目标**：用 OpenAlex 的引用关系（`referenced_works`）在本地文献池内构建有向引用图，算**枢纽度（PageRank）**与**桥接度（betweenness）**，缓解「高被引但主题跑偏的论文绑架排序」与「关键流派/必引文献漏检」两大痛点；并让 GapAnalyzer 用共引找未覆盖子领域。
+
+**变更内容**
+- **抓取引用图数据**：`openalex._parse_work` 现在提取 `openalex_id` 与 `referenced_works`（SELECT 字段加 `referenced_works`）；`base.make_paper` / `state.Paper` 新增 `openalex_id` / `referenced_works` 字段；`store._PERSIST_FIELDS` 与 `hydrate` 一并持久化，跨运行复用池不丢引用关系。
+- **新增 `src/agent/citation_graph.py`**（纯 Python 确定性算法，不依赖 networkx）：
+  - `build_graph`：以 `openalex_id` 为节点、只在池内互引的边构建有向图；
+  - `score_centrality`：就地写回每篇 `hub_score`（PageRank）/ `bridge_score`（betweenness），无引用数据时全部置 0（安全降级）；
+  - `cocitation_gaps`：把共享 >=2 篇参考文献的论文并查集聚成子领域，未被现有主题簇覆盖者标为研究空白候选。
+- **排序信号**：`tools.rank_papers` 综合分新增 `citation_hub_weight`（默认 0.10）× `hub_score` 项，让必引文献权重提升；未提供引用数据时该项恒为 0，等价旧行为。配置项 `CITATION_HUB_WEIGHT`。
+- **节点接线**：
+  - `ranker`：在闸门前后调用 `score_centrality`，并产出 `citation_analysis`（含 top_hub / top_bridge / 被闸门剔除的高枢纽论文告警）；
+  - `gap_analyzer`：调用 `cocitation_gaps` 把共引空白合并进 gaps（去重）；
+  - `synthesizer`：成稿新增**附录 A.8「引用网络分析」**，列出枢纽度 Top / 桥接度 Top 与高枢纽误删告警，使关键文献识别可复核。
+
+**涉及文件**
+- `src/ingest/openalex.py`：`_parse_work` 抓取 `openalex_id`/`referenced_works`；SELECT 加 `referenced_works`。
+- `src/ingest/base.py`：`Paper` 与 `make_paper` 新增 `openalex_id`/`referenced_works`。
+- `src/ingest/store.py`：`_PERSIST_FIELDS` 与 `hydrate` 持久化这两个字段。
+- `src/agent/citation_graph.py`：新增模块（build_graph / pagerank / betweenness / score_centrality / cocitation_gaps）。
+- `src/agent/config.py`：新增 `citation_hub_weight`（默认 0.10）。
+- `src/agent/state.py`：新增 `citation_analysis` 状态字段与初值；`Paper` 加引用图字段。
+- `src/agent/tools.py`：`rank_papers` 综合分加入枢纽度信号。
+- `src/agent/nodes.py`：`ranker` 调用 `score_centrality` 并产出 `citation_analysis`；`gap_analyzer` 接 `cocitation_gaps`；`synthesizer` 附录 A.8。
+- `tests/test_citation_graph.py`：新增 8 个测试（构图边、PageRank 枢纽序、betweenness 叶子为 0、共引空白命中/忽略已覆盖、ranker 写入分析、端到端 A.8 附录）。
+
+**验证**：`pytest tests/test_citation_graph.py` 全部通过；完整离线套件 110 passed（含 D' 8 个测试）。
