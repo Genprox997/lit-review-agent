@@ -101,3 +101,32 @@
 - `tests/test_citation_graph.py`：新增 8 个测试（构图边、PageRank 枢纽序、betweenness 叶子为 0、共引空白命中/忽略已覆盖、ranker 写入分析、端到端 A.8 附录）。
 
 **验证**：`pytest tests/test_citation_graph.py` 全部通过；完整离线套件 110 passed（含 D' 8 个测试）。
+
+---
+
+## 方向 B'：增量更新已有综述（2026-08-18）
+
+**目标**：让 lit-review-agent 能「接住」上一版成稿并做增量更新——载入历史文献池与引用编号、只新检索 `since_date` 之后的新论文、保留未变小节正文（省 LLM token）、沿用历史引用编号，并在成稿头渲染「新增/重写/保留」统计。直接对接你「定期更新某主题综述」的真实工作流。
+
+**变更内容**
+- **状态与配置**：`state.initial_state` 新增 `incremental / since_date / base_path` 入参；`AgentState` 新增 `incremental / since_date / base_path / previous_loaded / previous_pids / previous_sections / previous_clusters / incremental_keep / incremental_note` 字段（初值均为空/False/null）。`config` 新增 `incremental_default_days`（默认 180，作为未给 `since_date` 时的回看窗口）。
+- **载入历史文献池（retriever）**：增量模式下从 `base_path` 的 `<stem>_papers.json` 还原上一版文献并并入检索 seed，同时把上一版 `citation_map`（由 `citation_index` 重建）并入本轮，使历史引用编号跨版本延续；不入池（`previous_loaded`）只做一次。
+- **增量规划节点 `incremental_plan`（新增）**：把本版主题簇与上一版按论文重叠度匹配，重叠 ≥50% 的小节沿用上一版正文（`carry` 进 `sections`），其余标记重写；统计 `new`（不在上一版的论文数）/ `rewritten` / `kept` 写入 `incremental_note`。非增量模式直接放行、不改状态。
+- **section_writer 沿用旧正文**：用 `incremental_keep` 预填 `sections` 并跳过这些小节的重新生成，避免对未变小节重复消耗 LLM。
+- **成稿产物（synthesizer）**：写出 `<stem>_meta.json` 侧车（保存本版 `sections` + `clusters`），供下一版增量更新沿用；成稿头在增量模式下渲染「增量更新：新增 N 篇，重写 M 个小节，保留 K 个小节（沿用历史引用编号）」。
+- **图接线 / CLI / API**：`graph` 在 `clusterer → section_writer` 间插入 `incremental_plan`；`run_review` 新增 `incremental/since_date/base_path` 透传；`main.py` 新增 `--incremental/--since/--base`；`api.ReviewRequest` 新增同名字段，两个端点均接回。
+- **修复：retriever 日期过滤误伤常规运行**：原实现对 `since_date` 的过滤**无条件**执行——当 `since_date` 为空时回退到 `now - incremental_default_days`（≈2026），会把常规（非增量）运行里的历史文献全部过滤为空池导致图提前结束。已改为**仅增量模式**才按 `since_date` 过滤，常规运行不再受时间窗口影响。
+
+**涉及文件**
+- `src/agent/state.py`：`initial_state` 加增量入参；`AgentState` 加 9 个增量字段与初值。
+- `src/agent/config.py`：新增 `incremental_default_days`。
+- `src/agent/nodes.py`：新增 `_parse_since_year` / `_load_previous` / `incremental_plan`；`retriever` 载入历史池与编号、增量模式才做 since 过滤；`section_writer` 沿用 `incremental_keep`；`synthesizer` 写 `_meta.json` 侧车并渲染增量说明。
+- `src/agent/graph.py`：插入 `incremental_plan` 节点；`run_review` 透传增量参数。
+- `src/main.py`：新增 `--incremental/--since/--base`。
+- `src/api.py`：`ReviewRequest` 新增增量字段并接回 `run_review`。
+- `tests/test_incremental.py`：新增 4 个测试（节点级保留/跳过、端到端增量复用+编号延续+说明渲染、无 base 安全降级）。
+
+**配套测试加固（验证中发现）**
+- `tests/test_api_stream.py` 的 `client` fixture 只 patch 了 `src.agent.tools.multi_source_search`，但 `retriever` 通过 `src.agent.nodes` 模块级引用调用该函数，patch 实为无效——流式测试此前实际打真实 OpenAlex API，仅在 HTTP 磁盘缓存命中时「碰巧」通过，冷缓存即在 `base.py:http_get` 挂起。已改为同时 patch `nodes` 与 `tools` 两个命名空间的 `multi_source_search`，使该测试真正离线、确定可绿。
+
+**验证**：`pytest tests/test_incremental.py` 4 个全过；完整离线套件 **114 passed / 2 skipped / 2 deselected**（含 B' 4 个测试；2 skipped 为无 key 的真 LLM 测试，2 deselected 为联网标记测试）。

@@ -109,6 +109,11 @@ class Settings:
     citation_hub_weight: float = field(  # 引用网络枢纽度信号权重（方向 D'）
         default_factory=lambda: _env_float("CITATION_HUB_WEIGHT", 0.10)
     )
+
+    # ---- 增量更新回看窗口（方向 B'）----
+    incremental_default_days: int = field(
+        default_factory=lambda: _env_int("INCREMENTAL_DEFAULT_DAYS", 180)
+    )
     min_pool_after_gate: int = field(
         default_factory=lambda: _env_int("MIN_POOL_AFTER_GATE", 20)
     )

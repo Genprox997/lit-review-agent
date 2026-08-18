@@ -46,6 +46,9 @@ class ReviewRequest(BaseModel):
     lang: Optional[str] = Field(None, description="正文语言：zh / en")
     provider: Optional[str] = Field(None, description="LLM 提供商：deepseek/openai/ollama/stub")
     format: Optional[str] = Field(None, description="成稿格式：md / latex / docx")
+    incremental: bool = Field(False, description="增量更新模式：基于上一版成稿，只拉新文献、沿用编号")
+    since_date: Optional[str] = Field(None, description="增量起始日期 YYYY-MM-DD")
+    base_path: Optional[str] = Field(None, description="上一版成稿路径（.md），用于沿用编号与保留旧小节")
 
 
 def create_app():
@@ -110,6 +113,9 @@ def create_app():
                 thread_id=f"api-{abs(hash(req.topic)) % 10**9}",
                 with_human=False,
                 stream=False,
+                incremental=req.incremental,
+                since_date=req.since_date,
+                base_path=req.base_path,
             )
         except Exception as exc:  # noqa: BLE001 - 转成 500 并返回原因
             logger.exception("综述生成失败")
@@ -151,6 +157,9 @@ def create_app():
                     with_human=False,
                     stream=True,
                     on_progress=progress,
+                    incremental=req.incremental,
+                    since_date=req.since_date,
+                    base_path=req.base_path,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("综述生成失败")

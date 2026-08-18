@@ -30,8 +30,12 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
     monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
 
-    # 拦截网络检索，返回两篇假文献，保证全程离线
+    # 拦截网络检索，返回两篇假文献，保证全程离线。
+    # 注意：retriever 通过 `src.agent.nodes` 模块级引用调用 multi_source_search，
+    # 因此必须同时 patch `nodes` 与 `tools` 两个命名空间（二者各持一份引用），
+    # 否则图仍会打真实 OpenAlex/arXiv API 而触网挂起。
     from src.ingest.base import make_paper
+    from src.agent import nodes as N
     from src.agent import tools as T
 
     def fake_search(queries, settings=None, sources=None):
@@ -44,6 +48,7 @@ def client(monkeypatch, tmp_path):
                        source="openalex", doi="10.1/b"),
         ]
 
+    monkeypatch.setattr(N, "multi_source_search", fake_search)
     monkeypatch.setattr(T, "multi_source_search", fake_search)
 
     from src.api import create_app

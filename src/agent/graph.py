@@ -29,6 +29,7 @@ from src.agent.nodes import (
     ground_claims,
     faithfulness,
     human_review,
+    incremental_plan,
     parse_human_feedback,
     query_expander,
     ranker,
@@ -116,6 +117,7 @@ def build_graph(
     builder.add_node("ranker", ranker)
     builder.add_node("extractor", extractor)
     builder.add_node("clusterer", clusterer)
+    builder.add_node("incremental_plan", incremental_plan)  # 方向 B'：增量更新规划
     builder.add_node("section_writer", section_writer)
     builder.add_node("ground_claims", ground_claims)
     builder.add_node("critic", critic)
@@ -140,7 +142,8 @@ def build_graph(
 
     builder.add_edge("ranker", "extractor")
     builder.add_edge("extractor", "clusterer")
-    builder.add_edge("clusterer", "section_writer")
+    builder.add_edge("clusterer", "incremental_plan")
+    builder.add_edge("incremental_plan", "section_writer")
     builder.add_edge("section_writer", "ground_claims")
     builder.add_edge("ground_claims", "faithfulness")  # 方向 B：引用-论断一致性校验
     builder.add_edge("faithfulness", "critic")
@@ -216,6 +219,9 @@ def run_review(
     feedback: Optional[str] = None,
     stream: bool = True,
     on_progress: Optional[Callable[[str, Any], None]] = None,
+    incremental: bool = False,
+    since_date: Optional[str] = None,
+    base_path: Optional[str] = None,
 ) -> AgentState:
     """跑一次完整综述流程，返回终态。
 
@@ -236,9 +242,15 @@ def run_review(
         else:
             print(f"[提示] thread_id={thread_id} 未处于挂起态，作为全新运行处理。",
                   file=sys.stderr)
-            initial_input = initial_state(topic, constraints)
+            initial_input = initial_state(
+                topic, constraints, incremental=incremental,
+                since_date=since_date, base_path=base_path,
+            )
     else:
-        initial_input = initial_state(topic, constraints)
+        initial_input = initial_state(
+            topic, constraints, incremental=incremental,
+            since_date=since_date, base_path=base_path,
+        )
 
     if not stream:
         result = graph.invoke(initial_input, config)  # type: ignore[arg-type]

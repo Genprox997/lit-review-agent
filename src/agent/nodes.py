@@ -10,7 +10,8 @@ import json
 import logging
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Sequence
 
 from langgraph.types import interrupt
@@ -34,6 +35,7 @@ from src.agent.tools import (
 )
 from src.cluster.theme_cluster import cluster_papers
 from src.config import get_settings
+from src.ingest.base import make_paper
 from src.ingest.openalex import enrich_citations
 from src.report.bibtex import build_bibtex, build_reference_list
 
@@ -54,6 +56,63 @@ def _log(msg: str) -> str:
 
 def _lang_hint() -> str:
     return P.LANG_HINT.get(get_settings().report_language, P.LANG_HINT["zh"])
+
+
+# ==========================================================================
+# 增量更新辅助（方向 B'）
+# ==========================================================================
+def _parse_since_year(since_date: Optional[str], default_days: int) -> Optional[int]:
+    """把 since_date（YYYY-MM-DD）或默认回看窗口换算成年份下限。"""
+    if since_date:
+        digits = "".join(ch for ch in str(since_date) if ch.isdigit())
+        if len(digits) >= 4:
+            return int(digits[:4])
+    cutoff = datetime.now() - timedelta(days=default_days)
+    return cutoff.year
+
+
+def _load_previous(base_path: str):
+    """载入上一版成稿的文献池 / 引用编号 / 小节正文 / 主题簇。
+
+    入参 ``base_path`` 为上一版的 `.md` 成稿（或其同名 `.json` / 目录）；
+    从同目录的 ``<stem>_papers.json`` 与 ``<stem>_meta.json`` 还原信息。
+    返回 ``(prev_papers, prev_citation_map, prev_sections, prev_clusters)``，
+    任一文件缺失则对应项为空，调用方安全降级。
+    """
+    base = Path(base_path)
+    if base.suffix == ".md":
+        stem = base.name[: -len("_review.md")] if base.name.endswith("_review.md") else base.stem
+        d = base.parent
+    else:
+        d = base.parent
+        stem = base.stem
+
+    papers_file = d / f"{stem}_papers.json"
+    meta_file = d / f"{stem}_meta.json"
+
+    prev_papers: List[dict] = []
+    prev_citation_map: Dict[str, int] = {}
+    if papers_file.exists():
+        try:
+            for rec in json.loads(papers_file.read_text(encoding="utf-8")):
+                prev_papers.append(make_paper(**{k: v for k, v in rec.items()}))
+                if rec.get("citation_index") is not None:
+                    prev_citation_map[rec["paper_id"]] = int(rec["citation_index"])
+        except Exception as exc:
+            logger.debug("载入上一版文献失败（跳过）: %s", exc)
+            prev_papers, prev_citation_map = [], {}
+
+    prev_sections: Dict[str, str] = {}
+    prev_clusters: List[dict] = []
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            prev_sections = meta.get("sections", {}) or {}
+            prev_clusters = meta.get("clusters", []) or []
+        except Exception as exc:
+            logger.debug("载入上一版 meta 失败（跳过）: %s", exc)
+
+    return prev_papers, prev_citation_map, prev_sections, prev_clusters
 
 
 # ==========================================================================
@@ -120,6 +179,25 @@ def retriever(state: AgentState) -> dict:
     if seed:
         logger.info("Retriever: 从本地文献池召回 %d 条历史文献", len(seed))
 
+    # ---- 增量更新（方向 B'）：载入上一版文献池、沿用引用编号 ----
+    inc_updates: dict = {}
+    if state.get("incremental") and not state.get("previous_loaded") and state.get("base_path"):
+        prev_papers, prev_citation_map, prev_sections, prev_clusters = _load_previous(
+            state["base_path"]
+        )
+        if prev_papers:
+            seed = (seed or []) + prev_papers
+            merged_citation = dict(state.get("citation_map") or {})
+            merged_citation.update(prev_citation_map)
+            inc_updates = {
+                "citation_map": merged_citation,
+                "previous_loaded": True,
+                "previous_pids": [p["paper_id"] for p in prev_papers],
+                "previous_sections": prev_sections,
+                "previous_clusters": prev_clusters,
+            }
+            logger.info("Retriever(增量): 载入上一版 %d 篇文献，沿用历史引用编号", len(prev_papers))
+
     original_limit = settings.max_results_per_query
     if round_no > 0:
         settings.max_results_per_query = min(100, original_limit * (round_no + 1))
@@ -129,6 +207,18 @@ def retriever(state: AgentState) -> dict:
     finally:
         settings.max_results_per_query = original_limit
 
+    # ---- 增量更新（方向 B'）：仅保留 since_date 之后的新文献 ----
+    # 注意：仅增量模式才过滤日期；常规运行（incremental=False）不应用任何
+    # 时间窗口，否则默认回看窗口会把绝大部分历史文献误删为空池。
+    if state.get("incremental"):
+        since_year = _parse_since_year(state.get("since_date"), settings.incremental_default_days)
+        if since_year:
+            before = len(fresh)
+            fresh = [p for p in fresh if (p.get("year") or 0) >= since_year]
+            if before != len(fresh):
+                logger.info("Retriever(增量): since_date 过滤后保留 %d/%d 篇（>=%d）",
+                            len(fresh), before, since_year)
+
     merged = dedup_papers(list(state.get("papers") or []) + seed + fresh)
 
     # 用本地缓存回填引用数/摘要/DOI，并写回本轮文献池（跨运行复用）
@@ -136,6 +226,7 @@ def retriever(state: AgentState) -> dict:
     save_to_store(merged)
 
     return {
+        **inc_updates,
         "papers": merged,
         "pending_queries": [],
         "retrieval_round": round_no + 1,
@@ -363,6 +454,64 @@ def clusterer(state: AgentState) -> dict:
 
 
 # ==========================================================================
+# 5.5 IncrementalPlan —— 增量更新规划（方向 B'）
+# ==========================================================================
+def incremental_plan(state: AgentState) -> dict:
+    """增量更新规划：对比本版主题簇与上一版，决定保留/重写哪些小节。
+
+    - 非增量模式：直接放行，不改任何状态；
+    - 增量模式：把「本版簇」与「上一版簇」按论文重叠度匹配，重叠 >=50% 的小节
+      沿用上一版正文（省 LLM token），其余小节标记重写；同时统计新增论文数，
+      写入 `incremental_note` 供成稿渲染。
+    """
+    if not state.get("incremental"):
+        return {}
+
+    prev_clusters = state.get("previous_clusters") or []
+    prev_sections = state.get("previous_sections") or {}
+    prev_pids = set(state.get("previous_pids") or [])
+    current_pids = {p["paper_id"] for p in (state.get("papers") or [])}
+    new_pids = current_pids - prev_pids
+
+    kept: List[str] = []
+    carry: Dict[str, str] = {}
+    for c in state.get("clusters") or []:
+        c_pids = set(c.get("paper_ids") or [])
+        best, best_ratio = None, 0.0
+        for pc in prev_clusters:
+            pc_pids = set(pc.get("paper_ids") or [])
+            if not c_pids:
+                continue
+            ratio = len(c_pids & pc_pids) / len(c_pids)
+            if ratio > best_ratio:
+                best, best_ratio = pc, ratio
+        label = c["label"]
+        if best is not None and best_ratio >= 0.5 and best.get("label") in prev_sections:
+            kept.append(label)
+            carry[label] = prev_sections[best["label"]]
+        else:
+            logger.debug("IncrementalPlan: 小节 %r 将重写（重叠 %.2f）", label, best_ratio)
+
+    note = {
+        "new": len(new_pids),
+        "rewritten": len(state.get("clusters") or []) - len(kept),
+        "kept": len(kept),
+        "base": state.get("base_path"),
+    }
+    return {
+        "incremental_keep": kept,
+        "sections": carry,
+        "incremental_note": note,
+        "logs": [
+            _log(
+                f"IncrementalPlan: 新增 {note['new']} 篇，保留 {note['kept']} 个小节、"
+                f"重写 {note['rewritten']} 个小节（沿用历史编号）"
+            )
+        ],
+    }
+
+
+# ==========================================================================
 # 6. SectionWriter
 # ==========================================================================
 def _evidence_block(
@@ -400,9 +549,14 @@ def section_writer(state: AgentState) -> dict:
     ev_by_id = {e["paper_id"]: e for e in (state.get("evidence") or [])}
     citation_map = state.get("citation_map") or {}
 
-    sections: Dict[str, str] = {}
+    # 增量更新（方向 B'）：沿用上一版正文的小节直接保留，不参与重新生成
+    keep_set = set(state.get("incremental_keep") or []) if state.get("incremental") else set()
+    sections: Dict[str, str] = dict(state.get("sections") or {})
     specs: List[tuple] = []  # (cluster_label, allowed_set, llm_item)
     for cluster in clusters:
+        label = cluster["label"]
+        if label in keep_set:
+            continue  # 沿用上一版正文
         pids = cluster["paper_ids"]
         allowed = [citation_map[pid] for pid in pids[:MAX_EVIDENCE_PER_SECTION] if pid in citation_map]
         if not allowed:
@@ -783,6 +937,21 @@ def synthesizer(state: AgentState) -> dict:
         encoding="utf-8",
     )
 
+    # --- 增量更新侧车（方向 B'）：保存本版小节正文与主题簇，供下一版沿用编号 + 保留旧小节 ---
+    meta_path = out / f"{slug}_{stamp}_meta.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "sections": {k: v for k, v in (state.get("sections") or {}).items()},
+                "clusters": state.get("clusters") or [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    paths["meta"] = str(meta_path)
+
     # --- 多格式输出（方向 C）：在 Markdown 之外按需再产出 LaTeX / docx ---
     fmt = settings.output_format
     if fmt in ("latex", "docx"):
@@ -845,6 +1014,15 @@ def _assemble_markdown(
     else:
         fulltext_note = "基于摘要撰写（未获取到可用 OA 全文）"
     parts.append(f"# {state['topic']} —— 文献综述\n")
+
+    # 增量更新说明（方向 B'）：在成稿头渲染新增/重写/保留统计
+    inc = state.get("incremental_note") or {}
+    inc_line = ""
+    if state.get("incremental") and inc:
+        inc_line = (
+            f"> 增量更新：新增 {inc.get('new', 0)} 篇，重写 {inc.get('rewritten', 0)} 个小节，"
+            f"保留 {inc.get('kept', 0)} 个小节（沿用历史引用编号）。\n"
+        )
     parts.append(
         "> 本文由 **lit-review-agent** 自动生成。\n>\n"
         f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} | "
@@ -853,6 +1031,7 @@ def _assemble_markdown(
         f"年份跨度 {year_range(cited_papers_all)}\n>\n"
         "> 所有论断均带内联引用 `[n]`，编号对应文末参考文献表；"
         f"{fulltext_note}。\n"
+        + inc_line
     )
 
     parts.append("## 摘要\n\n" + (abstract or "（生成失败）"))

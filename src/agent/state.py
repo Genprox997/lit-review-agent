@@ -82,6 +82,17 @@ class AgentState(TypedDict, total=False):
     faithfulness: Dict[str, Any]                # 引用-论断一致性校验（faithfulness，方向 B）
     citation_analysis: Dict[str, Any]           # 引用网络分析（方向 D'）：枢纽/桥接论文、告警
 
+    # ---- 增量更新（方向 B'）----
+    incremental: bool                         # 是否增量更新模式
+    since_date: Optional[str]                 # 仅拉取该日期之后的新文献（YYYY-MM-DD）
+    base_path: Optional[str]                  # 上一版成稿路径（沿用编号 + 保留旧小节）
+    previous_loaded: bool                     # retriever 是否已加载上一版（防重复加载）
+    previous_pids: List[str]                  # 上一版文献 paper_id 集合
+    previous_sections: Dict[str, str]         # 上一版各小节正文
+    previous_clusters: List[Dict[str, Any]]   # 上一版主题簇（按论文重叠匹配用）
+    incremental_keep: List[str]               # 本版需保留旧正文的小节标题
+    incremental_note: Dict[str, Any]          # 增量更新说明（成稿头/附录渲染）
+
     # ---- 输出 ----
     report: str                                 # 最终 Markdown 成稿
     bibtex: str                                 # BibTeX 内容
@@ -98,7 +109,13 @@ class AgentState(TypedDict, total=False):
     logs: Annotated[List[str], operator.add]    # 人类可读的执行轨迹
 
 
-def initial_state(topic: str, constraints: str = "") -> AgentState:
+def initial_state(
+    topic: str,
+    constraints: str = "",
+    incremental: bool = False,
+    since_date: Optional[str] = None,
+    base_path: Optional[str] = None,
+) -> AgentState:
     return {
         "topic": topic,
         "constraints": constraints,
@@ -126,4 +143,13 @@ def initial_state(topic: str, constraints: str = "") -> AgentState:
         "retrieval_round": 0,
         "critic_round": 0,
         "logs": [],
+        "incremental": incremental,
+        "since_date": since_date,
+        "base_path": base_path,
+        "previous_loaded": False,
+        "previous_pids": [],
+        "previous_sections": {},
+        "previous_clusters": [],
+        "incremental_keep": [],
+        "incremental_note": {},
     }

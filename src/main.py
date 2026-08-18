@@ -72,6 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="禁用检索 HTTP 磁盘缓存，每次都重新打学术 API")
     g3.add_argument("--print-graph", action="store_true", help="打印状态机结构后退出")
     g3.add_argument("-v", "--verbose", action="store_true", help="输出 DEBUG 日志")
+
+    g4 = p.add_argument_group("增量更新（方向 B'）")
+    g4.add_argument("--incremental", action="store_true",
+                    help="增量更新模式：基于上一版成稿，只拉新文献、沿用历史引用编号、保留未变小节")
+    g4.add_argument("--since", default=None,
+                    help="增量模式起始日期 YYYY-MM-DD，只拉取该日之后的新文献（默认回看 180 天）")
+    g4.add_argument("--base", default=None,
+                    help="上一版成稿路径（.md），用于沿用编号与保留旧小节正文")
     return p
 
 
@@ -161,6 +169,9 @@ def main(argv: list[str] | None = None) -> int:
                 with_human=True,
                 feedback=args.feedback or "approve",
                 stream=True,
+                incremental=args.incremental,
+                since_date=args.since,
+                base_path=args.base,
             )
         elif args.human:
             thread_id = args.thread_id or f"run-{int(time.time())}"
@@ -170,6 +181,9 @@ def main(argv: list[str] | None = None) -> int:
                 thread_id=thread_id,
                 with_human=True,
                 stream=True,
+                incremental=args.incremental,
+                since_date=args.since,
+                base_path=args.base,
             )
         else:
             thread_id = args.thread_id or f"run-{int(time.time())}"
@@ -179,6 +193,9 @@ def main(argv: list[str] | None = None) -> int:
                 thread_id=thread_id,
                 with_human=False,
                 stream=True,
+                incremental=args.incremental,
+                since_date=args.since,
+                base_path=args.base,
             )
     except RuntimeError as e:
         if "langgraph-checkpoint-sqlite" in str(e):
