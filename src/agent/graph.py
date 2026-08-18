@@ -27,6 +27,7 @@ from src.agent.nodes import (
     extractor,
     gap_analyzer,
     ground_claims,
+    faithfulness,
     human_review,
     parse_human_feedback,
     query_expander,
@@ -119,6 +120,7 @@ def build_graph(
     builder.add_node("ground_claims", ground_claims)
     builder.add_node("critic", critic)
     builder.add_node("gap_analyzer", gap_analyzer)
+    builder.add_node("faithfulness", faithfulness)
     builder.add_node("synthesizer", synthesizer)
     # 仅在启用 --human 时挂起等待审核；否则用占位节点直接放行（避免无谓中断）
     builder.add_node("human_review", human_review if with_human else skip_human_review)
@@ -140,7 +142,8 @@ def build_graph(
     builder.add_edge("extractor", "clusterer")
     builder.add_edge("clusterer", "section_writer")
     builder.add_edge("section_writer", "ground_claims")
-    builder.add_edge("ground_claims", "critic")
+    builder.add_edge("ground_claims", "faithfulness")  # 方向 B：引用-论断一致性校验
+    builder.add_edge("faithfulness", "critic")
 
     # 外环
     builder.add_conditional_edges(

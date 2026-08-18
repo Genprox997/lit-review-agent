@@ -63,3 +63,45 @@ def test_ground_claims_empty_section_skipped(stub_env):
     st["sections"] = {"空小节": "没有任何引用编号的文字。"}  # 无 [n]
     out = N.ground_claims(st)
     assert out["grounded_claims"] == []
+
+
+def _state_with_grounded():
+    st = _state_with_sections()
+    st["grounded_claims"] = [{
+        "section": "视觉识别路线",
+        "claims": [
+            {"text": "CNN 提升图像识别", "paper_ids": ["arxiv:1"], "confidence": "high"},
+            {"text": "ViT 在基准领先", "paper_ids": ["doi:10.1/b"], "confidence": "medium"},
+        ],
+    }]
+    return st
+
+
+def test_faithfulness_populates(stub_env):
+    """stub 默认判定全部 supported：校验数=2，得分 1.0，无告警。"""
+    from src.agent import nodes as N
+
+    out = N.faithfulness(_state_with_grounded())
+    f = out["faithfulness"]
+    assert f["checked"] == 2
+    assert f["score"] == 1.0
+    assert f["flagged"] == []
+
+
+def test_faithfulness_disabled(stub_env, monkeypatch):
+    monkeypatch.setenv("ENABLE_FAITHFULNESS", "false")
+    get_settings(refresh=True)
+    from src.agent import nodes as N
+
+    out = N.faithfulness(_state_with_grounded())
+    assert out["faithfulness"].get("skipped") is True
+
+
+def test_faithfulness_no_claims_skipped(stub_env):
+    from src.agent import nodes as N
+
+    st = initial_state("t")
+    st["grounded_claims"] = []
+    out = N.faithfulness(st)
+    assert out["faithfulness"].get("skipped") is True
+

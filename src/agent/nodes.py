@@ -485,6 +485,74 @@ def ground_claims(state: AgentState) -> dict:
     }
 
 
+def faithfulness(state: AgentState) -> dict:
+    """引用-论断一致性校验（LLM-as-Judge，方向 B）。
+
+    把 `grounded_claims` 中每条 claim 与其支撑论文证据交给 LLM 判定是否真被支持，
+    输出整体一致性得分与疑似无支撑的论断列表，写入 `faithfulness`，
+    供成稿附录 A.7 呈现与告警，形成「生成 + 自检」闭环。
+    """
+    settings = get_settings()
+    grounded = state.get("grounded_claims") or []
+    evidence = state.get("evidence") or []
+    by_id = {e["paper_id"]: e for e in evidence}
+
+    if not settings.enable_faithfulness:
+        return {"faithfulness": {"skipped": True},
+                "logs": [_log("Faithfulness: 已关闭（ENABLE_FAITHFULNESS=false），跳过")]}
+    if not grounded:
+        return {"faithfulness": {"score": 1.0, "checked": 0, "flagged": [], "skipped": True},
+                "logs": [_log("Faithfulness: 无 claim 可校验，跳过")]}
+
+    specs: List[tuple] = []
+    for g in grounded:
+        section = g.get("section", "")
+        for c in g.get("claims", []):
+            ev_lines = []
+            for pid in c.get("paper_ids", []):
+                ev = by_id.get(pid, {})
+                txt = (ev.get("claim") or "").strip()
+                if txt:
+                    ev_lines.append(f"- [{pid}] {txt[:300]}")
+            user = P.FAITHFULNESS_USER.format(
+                claim=c.get("text", ""),
+                evidence_block="\n".join(ev_lines) or "（无支撑证据）",
+            )
+            specs.append((
+                section, c.get("text", ""),
+                {
+                    "node": "faithfulness",
+                    "system": P.FAITHFULNESS_SYSTEM.format(lang_hint=_lang_hint()),
+                    "user": user,
+                },
+            ))
+
+    if not specs:
+        return {"faithfulness": {"score": 1.0, "checked": 0, "flagged": [], "skipped": True},
+                "logs": [_log("Faithfulness: 无 claim 可校验，跳过")]}
+
+    results = chat_json_many([s[2] for s in specs], default={}) if specs else []
+    flagged: List[Dict[str, Any]] = []
+    supported = 0
+    for spec, data in zip(specs, results):
+        data = data or {}
+        verdict = str(data.get("verdict", "supported")).lower()
+        reason = str(data.get("reason", ""))
+        if verdict.startswith("unsupp"):
+            flagged.append({"section": spec[0], "text": spec[1], "reason": reason})
+        else:
+            supported += 1
+    checked = len(specs)
+    score = round(supported / checked, 3) if checked else 1.0
+    return {
+        "faithfulness": {"score": score, "checked": checked, "flagged": flagged},
+        "logs": [_log(
+            f"Faithfulness: 校验 {checked} 条 claim，{len(flagged)} 条疑似无充分支撑"
+            f"（一致性得分 {score}）"
+        )],
+    }
+
+
 def _strip_invalid_citations(text: str, allowed: set) -> str:
     """删除模型编造的、不在候选列表中的引用编号，保证引用可追溯。"""
 
@@ -803,6 +871,24 @@ def _assemble_markdown(
                 conf = c.get("confidence", "medium")
                 lines.append(f"- {badge.get(conf, '◐ 中')} {c.get('text', '')} {nums}")
         appendix.append("\n".join(lines) or "（无）")
+
+    # A.7 引用-论断一致性校验（faithfulness，方向 B）：让自检闭环可复核
+    faith = state.get("faithfulness") or {}
+    if faith and not faith.get("skipped"):
+        appendix.append("\n### A.7 引用-论断一致性校验（faithfulness）\n")
+        appendix.append(
+            f"- 校验论断 {faith.get('checked', 0)} 条，一致性得分 "
+            f"**{faith.get('score', 1.0)}**（1.0 = 全部有充分支撑）"
+        )
+        flagged = faith.get("flagged") or []
+        if flagged:
+            appendix.append("- 以下论断支撑证据不足，建议人工复核：")
+            for f in flagged[:15]:
+                appendix.append(
+                    f"  - [{f.get('section', '')}] {f.get('text', '')} — {f.get('reason', '')}"
+                )
+        else:
+            appendix.append("- 未发现明显无支撑论断。")
 
     parts.append("\n".join(appendix))
 

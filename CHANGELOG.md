@@ -25,3 +25,25 @@
 - `tests/test_graph.py`：新增稳定编号、改写路由、改写回环等 7 个测试。
 
 **验证**：`pytest tests/test_graph.py` 全部通过（含 `test_human_targeted_rewrite_loop` 端到端改写回环、稳定编号单测）。完整离线套件 96 passed。
+
+---
+
+## 方向 B：引用-论断一致性自动评测（faithfulness，LLM-as-Judge）（2026-08-18）
+
+**目标**：把已有的 Claim 级证据锚定（`grounded_claims`）物化为一道**自动质检闸**——逐条校验正文论断是否真被其引用的论文支撑，让综述从「生成」进阶到「生成 + 自检」闭环，也是面试常备的 LLM-as-Judge 能力落地。
+
+**变更内容**
+- 新增 `faithfulness` 节点（插入 `ground_claims` 与 `critic` 之间）：把每条 claim 与其支撑论文证据交给 LLM 判定 `supported / partial / unsupported`，汇总一致性得分（1.0 = 全部有充分支撑）与疑似无支撑论断列表。
+- `synthesizer` 成稿新增**附录 A.7**渲染校验结果（校验条数、得分、逐条告警），使自检过程可复核。
+- 可用 `ENABLE_FAITHFULNESS=false` 关闭（默认开启），避免对成本敏感的批量任务额外开销。
+
+**涉及文件**
+- `src/agent/prompts.py`：新增 `FAITHFULNESS_SYSTEM/USER`。
+- `src/agent/llm.py`：stub 新增 `_faithfulness` 桩（默认全部 supported）。
+- `src/agent/nodes.py`：新增 `faithfulness` 节点；`synthesizer` 附录 A.7 渲染。
+- `src/agent/graph.py`：接入 `faithfulness` 节点（`ground_claims → faithfulness → critic`）。
+- `src/config.py`：新增 `enable_faithfulness`（默认 True）。
+- `tests/test_ground.py`：新增 faithfulness 节点单测（含关闭 / 无 claim 跳过分支）。
+- `tests/test_graph.py`：新增 `test_faithfulness_appears_in_report` 端到端校验。
+
+**验证**：`pytest tests/test_ground.py tests/test_graph.py` 全部通过；完整离线套件 100 passed。

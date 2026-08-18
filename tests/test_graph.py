@@ -432,3 +432,18 @@ def test_human_targeted_rewrite_loop(stub_env, offline_retrieval):
     assert len(second.get("sections", {})) == len(first_sections), "小节数应保持一致"
     for path in second.get("artifacts", {}).values():
         assert os.path.exists(path), f"产物缺失: {path}"
+
+
+def test_faithfulness_appears_in_report(stub_env, offline_retrieval):
+    """faithfulness 节点结果应写入成稿附录 A.7。"""
+    stub_env.target_paper_count = 10
+    stub_env.max_retrieval_rounds = 1
+    graph = build_graph()
+    final = graph.invoke(
+        initial_state("topic x"),
+        {"configurable": {"thread_id": "faith-e2e"}, "recursion_limit": 60},
+    )
+    report = final["report"]
+    assert "A.7" in report
+    assert "一致性得分" in report
+    assert final["faithfulness"]["checked"] >= 1
