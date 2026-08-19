@@ -334,6 +334,20 @@ _WEBUI_HTML = """<!DOCTYPE html>
     <div id="graphInfo" style="margin-top:8px;font-size:13px;color:#1f2933;min-height:48px;line-height:1.5;"></div>
   </div>
 
+  <div id="qualityPanel" style="display:none; margin-top:18px;">
+    <h3>📊 质量评估仪表盘（总分 / 各维度 / 改进建议）</h3>
+    <div id="qOverall" style="display:flex;align-items:center;gap:18px;margin:6px 0 14px;">
+      <svg id="qRing" width="120" height="120" viewBox="0 0 120 120"></svg>
+      <div>
+        <div id="qGrade" style="font-size:34px;font-weight:800;line-height:1;"></div>
+        <div id="qOverallText" style="color:#475569;font-size:13px;margin-top:4px;"></div>
+      </div>
+    </div>
+    <div id="qDims"></div>
+    <div id="qWeak" style="margin-top:12px;"></div>
+    <div id="qHigh" style="margin-top:8px;"></div>
+  </div>
+
 <script>
 const log = document.getElementById("log");
 let currentThreadId = null;
@@ -365,6 +379,9 @@ function handleEvent(ev) {
     document.getElementById("draft").style.display = "none";
     if (payload.citation_graph && payload.citation_graph.nodes && payload.citation_graph.nodes.length) {
       renderGraph(payload.citation_graph);
+    }
+    if (payload.quality_report && typeof payload.quality_report === "object") {
+      renderQuality(payload.quality_report);
     }
   } else if (stage === "error") {
     append("❌ 错误：" + payload, "done");
@@ -448,6 +465,78 @@ async function resumeRun(feedback) {
   } catch (e) {
     append("❌ 续跑失败：" + e, "done");
   } finally { btn.disabled = false; }
+}
+
+// ===== 质量评估仪表盘（方向 F'）=====
+function colorForScore(s) {
+  if (s >= 85) return "#16a34a";
+  if (s >= 70) return "#22c55e";
+  if (s >= 55) return "#d97706";
+  return "#dc2626";
+}
+function renderQuality(r) {
+  document.getElementById("qualityPanel").style.display = "block";
+  const overall = r.overall || 0;
+  const grade = r.grade || "D";
+
+  // --- 总分环 ---
+  const ring = document.getElementById("qRing");
+  const R = 48, C = 2 * Math.PI * R;
+  const frac = Math.max(0, Math.min(100, overall)) / 100;
+  const col = colorForScore(overall);
+  ring.innerHTML =
+    '<circle cx="60" cy="60" r="' + R + '" fill="none" stroke="#e2e8f0" stroke-width="12"/>' +
+    '<circle cx="60" cy="60" r="' + R + '" fill="none" stroke="' + col + '" stroke-width="12" ' +
+    'stroke-linecap="round" stroke-dasharray="' + (C * frac).toFixed(1) + ' ' + C.toFixed(1) + '" ' +
+    'transform="rotate(-90 60 60)"/>' +
+    '<text x="60" y="58" text-anchor="middle" font-size="26" font-weight="800" fill="' + col + '">' + overall + '</text>' +
+    '<text x="60" y="78" text-anchor="middle" font-size="12" fill="#64748b">/ 100</text>';
+  document.getElementById("qGrade").textContent = "等级 " + grade;
+  document.getElementById("qGrade").style.color = col;
+  const st = r.stats || {};
+  document.getElementById("qOverallText").textContent =
+    st.paper_count + " 篇文献 · " + st.section_count + " 小节 · " +
+    st.cluster_count + " 主题簇 · " + st.gap_count + " 研究空白 · " + st.claim_count + " 条 claim 锚定";
+
+  // --- 维度条 ---
+  const dims = (r.dimensions || []);
+  let html = "";
+  for (const d of dims) {
+    const score = d.score;
+    if (score === null || score === undefined) {
+      html += '<div style="margin:8px 0;"><div style="display:flex;justify-content:space-between;font-size:13px;">' +
+        '<span>' + esc(d.name) + '</span><span style="color:#94a3b8;">未评估</span></div>' +
+        '<div style="height:8px;background:#f1f5f9;border-radius:4px;margin-top:3px;"></div>' +
+        '<div style="font-size:11px;color:#94a3b8;margin-top:2px;">' + esc(d.note || "") + '</div></div>';
+      continue;
+    }
+    const c = colorForScore(score);
+    html += '<div style="margin:8px 0;">' +
+      '<div style="display:flex;justify-content:space-between;font-size:13px;">' +
+      '<span>' + esc(d.name) + '</span><span style="font-weight:700;color:' + c + ';">' + score + '</span></div>' +
+      '<div style="height:8px;background:#f1f5f9;border-radius:4px;margin-top:3px;overflow:hidden;">' +
+      '<div style="height:100%;width:' + score + '%;background:' + c + ';border-radius:4px;"></div></div>' +
+      '<div style="font-size:11px;color:#64748b;margin-top:2px;">' + esc(d.note || "") + '</div></div>';
+  }
+  document.getElementById("qDims").innerHTML = html;
+
+  // --- 改进建议 ---
+  const weak = r.weaknesses || [];
+  document.getElementById("qWeak").innerHTML = weak.length
+    ? '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px 12px;">' +
+      '<div style="font-weight:700;color:#b91c1c;margin-bottom:6px;">⚠ 改进建议</div>' +
+      '<ul style="margin:0;padding-left:18px;font-size:13px;color:#7f1d1d;line-height:1.6;">' +
+      weak.map(w => '<li>' + esc(w) + '</li>').join("") + '</ul></div>'
+    : '<div style="color:#16a34a;font-size:13px;">✅ 各维度均达标，无需重点改进</div>';
+
+  // --- 亮点 ---
+  const high = r.highlights || [];
+  document.getElementById("qHigh").innerHTML = high.length
+    ? '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 12px;">' +
+      '<div style="font-weight:700;color:#15803d;margin-bottom:6px;">✨ 亮点</div>' +
+      '<ul style="margin:0;padding-left:18px;font-size:13px;color:#166534;line-height:1.6;">' +
+      high.map(h => '<li>' + esc(h) + '</li>').join("") + '</ul></div>'
+    : "";
 }
 
 // ===== 引用网络可视化（方向 E'）=====

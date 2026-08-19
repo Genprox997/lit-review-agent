@@ -200,3 +200,38 @@ def test_webui_index_has_graph_panel(client):
     assert "renderGraph" in resp.text
     assert "引用网络" in resp.text
     assert "hubOnly" in resp.text
+
+
+def test_stream_done_includes_quality_report(client):
+    """方向 F'：done 事件应回传 quality_report（维度/总分/薄弱项），供 Web UI 仪表盘渲染。"""
+    with client.stream("POST", "/review/stream", json={
+        "topic": "vision transformers", "provider": "stub", "target": 2, "with_human": False,
+    }) as resp:
+        assert resp.status_code == 200
+        events = _collect(resp)
+
+    stages = [s for s, _ in events]
+    assert "done" in stages
+    done = [p for s, p in events if s == "done"][0]
+    qr = done.get("quality_report") or {}
+    assert isinstance(qr, dict)
+    # 六个质量维度齐备
+    keys = {d["key"] for d in (qr.get("dimensions") or [])}
+    assert {"faithfulness", "citation_coverage", "network_hub",
+            "topic_balance", "recency", "grounding"} <= keys
+    # 总分与等级
+    assert isinstance(qr.get("overall"), int) and 0 <= qr["overall"] <= 100
+    assert qr.get("grade") in ("A", "B", "C", "D")
+    # 产物侧车应写入 quality_report.json
+    assert (done.get("artifacts") or {}).get("quality_report")
+
+
+def test_webui_index_has_quality_panel(client):
+    """方向 F'：Web UI 含质量评估仪表盘面板与渲染入口。"""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert 'id="qualityPanel"' in resp.text
+    assert "renderQuality" in resp.text
+    assert "质量评估仪表盘" in resp.text
+    assert 'id="qRing"' in resp.text
+    assert 'id="qWeak"' in resp.text

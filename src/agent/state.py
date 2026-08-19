@@ -82,6 +82,7 @@ class AgentState(TypedDict, total=False):
     faithfulness: Dict[str, Any]                # 引用-论断一致性校验（faithfulness，方向 B）
     citation_analysis: Dict[str, Any]           # 引用网络分析（方向 D'）：枢纽/桥接论文、告警
     citation_graph: Dict[str, Any]              # 引用网络可视化数据（方向 E'）：nodes/edges/gaps/stats
+    quality_report: Dict[str, Any]              # 质量评估仪表盘（方向 F'）：各维度得分、总分、薄弱项
 
     # ---- 增量更新（方向 B'）----
     incremental: bool                         # 是否增量更新模式
@@ -136,6 +137,7 @@ def initial_state(
         "faithfulness": {},
         "citation_analysis": {},
         "citation_graph": {},
+        "quality_report": {},
         "report": "",
         "bibtex": "",
         "artifacts": {},

@@ -310,6 +310,7 @@ def run_review(
                     "section_count": len(final.get("sections") or {}),
                     "artifacts": final.get("artifacts") or {},
                     "citation_graph": final.get("citation_graph") or {},
+                    "quality_report": final.get("quality_report") or {},
                 },
             )
     return final

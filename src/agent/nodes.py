@@ -20,6 +20,7 @@ from src.agent import prompts as P
 from src.agent.llm import chat, chat_json, chat_json_many, chat_many
 from src.agent.state import AgentState, Evidence
 from src.agent import citation_graph as CG  # 引用网络分析（方向 D'）
+from src.agent import quality as QL          # 质量评估仪表盘（方向 F'）
 from src.agent.tools import (
     apply_relevance_gate,
     compute_relevance,
@@ -963,6 +964,24 @@ def synthesizer(state: AgentState) -> dict:
     )
     paths["citation_graph"] = str(graph_path)
 
+    # --- 质量评估仪表盘（方向 F'）：聚合 B/D'/E'/P3-2 质量信号，落盘供 Web UI 渲染 ---
+    quality = QL.compute_quality_report(
+        papers=papers,
+        clusters=state.get("clusters") or [],
+        sections=sections,
+        faithfulness=state.get("faithfulness") or {},
+        citation_analysis=state.get("citation_analysis") or {},
+        citation_graph=graph_data,
+        grounded_claims=state.get("grounded_claims") or [],
+        gaps=gap_list,
+    )
+    quality_path = out / f"{slug}_{stamp}_quality_report.json"
+    quality_path.write_text(
+        json.dumps(quality, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    paths["quality_report"] = str(quality_path)
+
     # --- 多格式输出（方向 C）：在 Markdown 之外按需再产出 LaTeX / docx ---
     fmt = settings.output_format
     if fmt in ("latex", "docx"):
@@ -984,6 +1003,7 @@ def synthesizer(state: AgentState) -> dict:
         "report": report,
         "bibtex": bibtex,
         "citation_graph": graph_data,
+        "quality_report": quality,
         "artifacts": {k: str(v) for k, v in paths.items()},
         "logs": [
             _log(

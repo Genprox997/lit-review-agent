@@ -27,6 +27,36 @@
 
 ---
 
+## 方向 F'：质量评估仪表盘（2026-08-19）
+
+**目标**：把散落在各模块的「质量信号」聚合成一份**结构化、可序列化**的质量报告，既落盘为 `*_quality_report.json` 侧车，也在 Web UI 渲染成**质量评估仪表盘**——一键看清综述在「引用-论断一致性 / 引用覆盖 / 引用网络枢纽度 / 主题覆盖均衡 / 时效 / 证据锚定强度」六维度的得分、总分与改进建议，定稿前一眼定位薄弱点。复用方向 B（faithfulness）+ 方向 D'/E'（引用网络）+ P3-2（claim 锚定），零新依赖。
+
+**变更内容**
+- **质量聚合模块**（`src/agent/quality.py`，新）：`compute_quality_report(papers, clusters, sections, faithfulness, citation_analysis, citation_graph, grounded_claims, gaps)`，纯函数、零外部依赖。六个维度（各 0-100，带权重）：
+  1. 引用-论断一致性（faithfulness 一致性得分，方向 B）；
+  2. 引用覆盖（含 `[n]` 标注的小节占比）；
+  3. 引用网络枢纽度（有引用边则满分，高枢纽论文被相关性闸门剔除则扣分，方向 D'/E'）；
+  4. 主题覆盖均衡（簇规模均衡度，存在研究空白则乘 0.85）；
+  5. 时效（近 5 年文献占比）；
+  6. 证据锚定强度（claim 置信度 high/medium/low 加权，P3-2）。
+  总分按「可用维度」加权平均 → 等级 A/B/C/D；低于阈值的维度自动生成**改进建议**，表现优异的维度列出**亮点**。任一信号缺失即安全降级（`available=False`，不计入总分）。
+- **落盘与透传**：`AgentState` 新增 `quality_report` 字段；`synthesizer` 调 `compute_quality_report` 生成报告、写 `*_quality_report.json` 侧车并加入 `artifacts`，返回 dict 携带 `quality_report`。
+- **回传前端**：`run_review` 的 `done` 事件 payload 增加 `quality_report`，Web UI 无需二次请求即可渲染。
+- **Web UI（`src/api.py` 的 `_WEBUI_HTML`）**：新增质量评估仪表盘面板——总分环形进度（按等级着色）+ 各维度横向评分条（分数/权重/说明）+ 「⚠ 改进建议」红色卡片 + 「✨ 亮点」绿色卡片。纯原生 JS，无 CDN。
+
+**涉及文件**
+- `src/agent/quality.py`：新增 `compute_quality_report` 等。
+- `src/agent/state.py`：`AgentState` 增 `quality_report`；`initial_state` 种子 `{}`。
+- `src/agent/nodes.py`：导入 `quality`；`synthesizer` 生成并写 `quality_report.json` 侧车 + 返回 `quality_report`。
+- `src/agent/graph.py`：`done` 事件回传 `quality_report`。
+- `src/api.py` 的 `_WEBUI_HTML`：质量仪表盘面板 + `renderQuality` 渲染 JS。
+- `tests/test_quality.py`：新增 6 个 `compute_quality_report` 单测（六维度齐备 / 缺失数据安全降级 / faithfulness 低分告警 / 高枢纽剔除告警 / 研究空白降分告警 / 高一致性亮点）。
+- `tests/test_api_hitl.py`：新增 2 个测试（`done` 事件回传 `quality_report`；`GET /` 含仪表盘标记 `id="qualityPanel"`/`renderQuality`）。
+
+**验证**：`pytest tests/test_quality.py tests/test_api_hitl.py` 15 passed；完整离线套件 **132 passed / 2 skipped / 2 deselected**（无回归）。
+
+---
+
 ## 方向 A'：Web UI 接 HITL 反馈（2026-08-19）
 
 **目标**：把已落地的 HITL 闭环（方向 A 的 CLI `--human` 续跑）搬到浏览器——用户无需命令行，即可在网页里看草稿、提修改意见、多次迭代改稿后再一键定稿。
