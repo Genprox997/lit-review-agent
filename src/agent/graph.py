@@ -290,7 +290,17 @@ def run_review(
     final["interrupted"] = interrupted
     if on_progress:
         if interrupted:
-            on_progress("interrupted", {"report_path": (final.get("artifacts") or {}).get("report")})
+            on_progress(
+                "interrupted",
+                {
+                    "report_path": (final.get("artifacts") or {}).get("report"),
+                    "thread_id": thread_id,
+                    "report": final.get("report") or "",
+                    "paper_count": len(final.get("papers") or []),
+                    "section_count": len(final.get("sections") or {}),
+                    "citation_count": len(final.get("citation_map") or {}),
+                },
+            )
         else:
             on_progress(
                 "done",

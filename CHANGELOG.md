@@ -4,6 +4,29 @@
 
 ---
 
+## 方向 A'：Web UI 接 HITL 反馈（2026-08-19）
+
+**目标**：把已落地的 HITL 闭环（方向 A 的 CLI `--human` 续跑）搬到浏览器——用户无需命令行，即可在网页里看草稿、提修改意见、多次迭代改稿后再一键定稿。
+
+**变更内容**
+- **API 层**
+  - `ReviewRequest` 新增 `with_human`（启用人工审核）与 `thread_id`（HITL 续跑标识）字段；`/review/stream` 在 `with_human=True` 时强制 SQLite 检查点并以 SSE 推送 `interrupted` 事件（携带草稿全文 `report`、统计与 `thread_id`）。
+  - 新增 `POST /review/resume` SSE 端点：以 `Command(resume=feedback)` 续跑被挂起的 thread；续跑前预校验 thread 确处于 `human_review` 挂起态（否则 400，避免误触发全新运行）。空意见视为通过定稿，非空意见触发方向 A 的针对性改写回环。
+  - 抽取 `_sse_endpoint(runner)` 助手脚手，两个流式端点共用，避免重复。
+- **Web UI（`GET /`）**
+  - 新增「启用人工审核（HITL）」勾选框与草稿审核面板：挂起后展示草稿全文、文献/引用/小节统计与成稿文件路径；意见输入框 + 「提交修改意见并重生成」/「通过并定稿」两个按钮。
+  - 提交意见经 `/review/resume` 续跑并复用同一 SSE 消费逻辑；支持多轮「看草稿 → 提意见 → 改稿 → 再审核」闭环，最终 `done` 事件展示产物路径。
+
+**涉及文件**
+- `src/api.py`：`ReviewRequest`/`ResumeRequest` 字段；`/review/stream` 支持 `with_human` + 动态 `thread_id`；新增 `/review/resume` 与 `_sse_endpoint`；模块 docstring 更新。
+- `src/agent/graph.py`：`run_review` 的 `interrupted` 事件回传 `thread_id` / `report` / 统计。
+- `src/api.py` 的 `_WEBUI_HTML`：HITL 开关 + 草稿审核面板 + 续跑逻辑。
+- `tests/test_api_hitl.py`（新增）：Web UI 含 HITL 入口、interrupted 事件回传、approve 定稿、带意见改写后再定稿、坏 thread 400，共 5 个离线测试。
+
+**验证**：`pytest tests/test_api_hitl.py` 5 passed；完整离线套件 119 passed / 2 skipped / 2 deselected（无回归）。
+
+---
+
 ## 方向 A：Human-in-the-loop 闭环重生成 + 引用编号跨轮次稳定（2026-08-18）
 
 **目标**：把 LangGraph 的 `interrupt` / `Command(resume)` 能力用透——人工审核意见不再只留痕，而是触发**针对性重写**；同时让引用编号在 Critic 打回重聚类后保持稳定，避免用户看到的 `[n]` 指向完全不同的论文。

@@ -7,10 +7,11 @@
     uvicorn src.api:app --host 0.0.0.0 --port 8000
 
 接口：
-    GET  /           自包含 Web UI（表单 + 实时进度）
+    GET  /           自包含 Web UI（表单 + 实时进度 + 人工审核面板）
     GET  /healthz
     POST /review              一次性返回产物路径（非流式）
     POST /review/stream       SSE 流式返回执行进度，结束推送 done 事件
+    POST /review/resume       HITL 续跑：把人工意见回填给被挂起的 thread 并继续
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ import logging
 import os
 import queue
 import threading
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,48 @@ class ReviewRequest(BaseModel):
     incremental: bool = Field(False, description="增量更新模式：基于上一版成稿，只拉新文献、沿用编号")
     since_date: Optional[str] = Field(None, description="增量起始日期 YYYY-MM-DD")
     base_path: Optional[str] = Field(None, description="上一版成稿路径（.md），用于沿用编号与保留旧小节")
+    with_human: bool = Field(False, description="启用人工审核（HITL）：成稿后挂起，等 Web UI 回填意见再定稿")
+    thread_id: Optional[str] = Field(None, description="HITL 续跑用的 thread id；留空由服务端生成并在 interrupted 事件中返回")
+
+
+class ResumeRequest(BaseModel):
+    """HITL 续跑请求体：把人工意见回填给被挂起的 thread。"""
+    thread_id: str = Field(..., description="人工审核挂起时由 /review/stream 的 interrupted 事件返回的 thread id")
+    feedback: str = Field("", description="人工审核意见；空字符串表示通过并直接定稿")
+
+
+def _sse_endpoint(runner: Callable[[Callable[[str, Any], None]], None]):
+    """把 `runner(progress)` 的执行进度以 SSE 流式返回。
+
+    `runner` 内部调用 ``run_review(stream=True, on_progress=progress)``；进度事件、
+    挂起(``interrupted``)、完成(``done``)、错误(``error``) 都经同一队列回传，前端
+    据此刷新日志或弹出人工审核表单。响应体为 ``text/event-stream``。
+    """
+    q: "queue.Queue" = queue.Queue()
+
+    def progress(stage: str, payload: Any) -> None:
+        q.put({"stage": stage, "payload": payload})
+
+    def run() -> None:
+        try:
+            runner(progress)
+        except Exception as exc:  # noqa: BLE001 - 转成 error 事件
+            logger.exception("综述生成失败")
+            q.put({"stage": "error", "payload": str(exc)})
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+
+    def gen():
+        while True:
+            item = q.get()
+            yield f"event: {item['stage']}\ndata: {_json.dumps(item['payload'], ensure_ascii=False)}\n\n"
+            if item["stage"] in ("done", "error", "interrupted"):
+                break
+        # 确保工作线程在流式响应结束时退出，避免遗留守护线程拖累后续测试/进程
+        worker.join(timeout=60)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 def create_app():
@@ -137,47 +181,72 @@ def create_app():
 
     @app.post("/review/stream", response_model=None)
     def review_stream(req: ReviewRequest):
-        """SSE 流式接口：实时推送执行进度，结束后推送 done 事件与产物路径。"""
+        """SSE 流式接口：实时推送执行进度，结束后推送 done 事件与产物路径。
+
+        当 ``with_human=True`` 时，图会在 Synthesizer 之后挂起（interrupt），
+        本接口推送 ``interrupted`` 事件（携带草稿全文与 thread_id），前端据此
+        弹出人工审核面板；随后由 ``POST /review/resume`` 回填意见续跑。
+        """
         _apply_request(req)
         _check_key()
 
         from src.agent.graph import run_review
 
-        q: "queue.Queue" = queue.Queue()
+        if req.with_human:
+            tid = req.thread_id or f"hitl-{uuid.uuid4().hex[:12]}"
+            with_human = True
+        else:
+            tid = req.thread_id or f"api-{abs(hash(req.topic)) % 10**9}"
+            with_human = False
 
-        def progress(stage: str, payload: Any) -> None:
-            q.put({"stage": stage, "payload": payload})
+        def runner(progress: Callable[[str, Any], None]) -> None:
+            run_review(
+                topic=req.topic,
+                constraints=req.constraints,
+                thread_id=tid,
+                with_human=with_human,
+                stream=True,
+                on_progress=progress,
+                incremental=req.incremental,
+                since_date=req.since_date,
+                base_path=req.base_path,
+            )
 
-        def run() -> None:
-            try:
-                run_review(
-                    topic=req.topic,
-                    constraints=req.constraints,
-                    thread_id=f"api-{abs(hash(req.topic)) % 10**9}",
-                    with_human=False,
-                    stream=True,
-                    on_progress=progress,
-                    incremental=req.incremental,
-                    since_date=req.since_date,
-                    base_path=req.base_path,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("综述生成失败")
-                q.put({"stage": "error", "payload": str(exc)})
+        return _sse_endpoint(runner)
 
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
+    @app.post("/review/resume", response_model=None)
+    def review_resume(req: ResumeRequest):
+        """HITL 续跑：把人工意见回填给被挂起的 thread 并继续生成。
 
-        def gen():
-            while True:
-                item = q.get()
-                yield f"event: {item['stage']}\ndata: {_json.dumps(item['payload'], ensure_ascii=False)}\n\n"
-                if item["stage"] in ("done", "error", "interrupted"):
-                    break
-            # 确保工作线程在流式响应结束时退出，避免遗留守护线程拖累后续测试/进程
-            worker.join(timeout=60)
+        先校验该 thread 确实处于 ``human_review`` 挂起态（否则 400，避免误触发
+        全新运行）；随后以 ``Command(resume=feedback)`` 续跑——空意见视为通过定稿，
+        非空意见进入针对性改写回环。以 SSE 流回传进度/再次挂起/完成。
+        """
+        from src.agent.graph import build_graph, run_review
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        # 预校验：thread 必须处于 human_review 挂起态
+        graph = build_graph(with_human=True)
+        config = {"configurable": {"thread_id": req.thread_id}, "recursion_limit": 80}
+        snap = graph.get_state(config)
+        if not snap.next or "human_review" not in snap.next:
+            raise HTTPException(
+                status_code=400,
+                detail=f"thread_id={req.thread_id} 未处于人工审核挂起态，无法续跑。",
+            )
+
+        _check_key()
+
+        def runner(progress: Callable[[str, Any], None]) -> None:
+            run_review(
+                topic="",  # 续跑沿用检查点中的主题，无需重新传
+                with_human=True,
+                feedback=req.feedback,
+                thread_id=req.thread_id,
+                stream=True,
+                on_progress=progress,
+            )
+
+        return _sse_endpoint(runner)
 
     return app
 
@@ -202,6 +271,19 @@ _WEBUI_HTML = """<!DOCTYPE html>
   #log { margin-top: 18px; background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 6px; height: 320px; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
   .done { color: #22c55e; font-weight: 700; }
   a { color: #2563eb; }
+  .row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+  .row input[type=checkbox] { width: auto; }
+  #draft { margin-top: 18px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px; background: #fff; }
+  #draft h3 { margin: 0 0 8px; font-size: 15px; }
+  #draftMeta { color: #64748b; font-size: 12px; margin-bottom: 8px; }
+  #draftText { max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+              background: #f1f5f9; border-radius: 6px; padding: 10px; font-size: 12px;
+              font-family: ui-monospace, Menlo, Consolas, monospace; }
+  #feedback { width: 100%; min-height: 64px; margin-top: 10px; padding: 8px; box-sizing: border-box;
+              border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; resize: vertical; }
+  .btn-row { margin-top: 10px; display: flex; gap: 10px; }
+  .btn-row button { margin-top: 0; }
+  #approve { background: #16a34a; }
 </style>
 </head>
 <body>
@@ -222,11 +304,28 @@ _WEBUI_HTML = """<!DOCTYPE html>
   </select>
   <label>目标文献规模</label>
   <input id="target" type="number" value="40">
+  <div class="row">
+    <input type="checkbox" id="with_human">
+    <label style="margin:0;font-weight:600;cursor:pointer" for="with_human">启用人工审核（HITL）：成稿后可在网页里看草稿、提意见再定稿</label>
+  </div>
   <button id="go">开始生成</button>
   <div id="log"></div>
 
+  <div id="draft" style="display:none">
+    <h3>⏸ 草稿待审核</h3>
+    <div id="draftMeta"></div>
+    <pre id="draftText"></pre>
+    <textarea id="feedback" placeholder="在此填写修改意见，例如「在第 1 个主题小节补充与对比方法的实验分析」；留空点「通过并定稿」即直接定稿。"></textarea>
+    <div class="btn-row">
+      <button id="submitFeedback">提交修改意见并重生成</button>
+      <button id="approve">通过并定稿</button>
+    </div>
+  </div>
+
 <script>
 const log = document.getElementById("log");
+let currentThreadId = null;
+
 function append(text, cls) {
   const div = document.createElement("div");
   if (cls) div.className = cls;
@@ -234,52 +333,113 @@ function append(text, cls) {
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
 }
-document.getElementById("go").addEventListener("click", async () => {
-  const btn = document.getElementById("go");
-  btn.disabled = true; log.innerHTML = "";
-  const body = {
+
+function handleEvent(ev) {
+  const stage = ev.stage;
+  let payload;
+  try { payload = JSON.parse(ev.data); } catch (e) { payload = ev.data; }
+
+  if (stage === "progress") {
+    append("• " + payload);
+  } else if (stage === "human_review") {
+    append("⏸ 草稿已生成并挂起，请在下方预览并提交审核意见。", "done");
+  } else if (stage === "interrupted") {
+    currentThreadId = payload.thread_id || null;
+    showDraft(payload);
+  } else if (stage === "done") {
+    append("✅ 完成：" + (payload.paper_count||0) + " 篇文献，" + (payload.citation_count||0) + " 条引用", "done");
+    const arts = payload.artifacts || {};
+    for (const k in arts) append("  " + k + ": " + arts[k]);
+    document.getElementById("draft").style.display = "none";
+  } else if (stage === "error") {
+    append("❌ 错误：" + payload, "done");
+  } else {
+    append("[" + stage + "] " + JSON.stringify(payload));
+  }
+}
+
+function showDraft(payload) {
+  const draft = document.getElementById("draft");
+  document.getElementById("draftText").textContent = payload.report || "(无草稿内容)";
+  document.getElementById("draftMeta").textContent =
+    "文献 " + (payload.paper_count||0) + " 篇 / 引用 " + (payload.citation_count||0) + " 条 / 小节 " +
+    (payload.section_count||0) + " 个" + (payload.report_path ? " ｜ 文件：" + payload.report_path : "");
+  draft.style.display = "block";
+  document.getElementById("feedback").value = "";
+  append("⏸ 已挂起等待人工审核（thread_id=" + (currentThreadId||"") + "，可多次提意见后再定稿）", "done");
+}
+
+async function consumeStream(resp) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\\n\\n")) !== -1) {
+      const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      const ev = {};
+      raw.split("\\n").forEach(function(line) {
+        if (line.startsWith("event:")) ev.stage = line.slice(6).trim();
+        else if (line.startsWith("data:")) ev.data = line.slice(5).trim();
+      });
+      if (ev.stage && ev.data) handleEvent(ev);
+    }
+  }
+}
+
+function readForm() {
+  return {
     topic: document.getElementById("topic").value,
     constraints: document.getElementById("constraints").value,
     sources: document.getElementById("sources").value,
     provider: document.getElementById("provider").value,
     target: Number(document.getElementById("target").value) || undefined,
+    with_human: document.getElementById("with_human").checked,
   };
-  append("▶ 已提交，等待流…");
+}
+
+async function startRun() {
+  const btn = document.getElementById("go");
+  btn.disabled = true; log.innerHTML = "";
+  document.getElementById("draft").style.display = "none";
+  const body = readForm();
+  append("▶ 已提交，等待流…" + (body.with_human ? "（启用人工审核）" : ""));
   try {
     const resp = await fetch("/review/stream", {
       method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body),
     });
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\\n\\n")) !== -1) {
-        const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
-        const ev = {};
-        raw.split("\\n").forEach(function(line) {
-          if (line.startsWith("event:")) ev.stage = line.slice(6).trim();
-          else if (line.startsWith("data:")) ev.data = line.slice(5).trim();
-        });
-        if (ev.stage && ev.data) {
-          let payload; try { payload = JSON.parse(ev.data); } catch (e) { payload = ev.data; }
-          if (ev.stage === "progress") append("• " + payload);
-          else if (ev.stage === "done") {
-            append("✅ 完成：" + (payload.paper_count||0) + " 篇文献，" + (payload.citation_count||0) + " 条引用", "done");
-            const arts = payload.artifacts || {};
-            for (const k in arts) append("  " + k + ": " + arts[k]);
-          } else if (ev.stage === "error") append("❌ 错误：" + payload, "done");
-          else append("[" + ev.stage + "] " + JSON.stringify(payload));
-        }
-      }
-    }
+    if (!resp.ok) { append("❌ 服务端返回 " + resp.status + "：" + (await resp.text()), "done"); return; }
+    await consumeStream(resp);
   } catch (e) {
     append("❌ 请求失败：" + e, "done");
   } finally { btn.disabled = false; }
+}
+
+async function resumeRun(feedback) {
+  if (!currentThreadId) { append("❌ 当前没有可续跑的 thread_id", "done"); return; }
+  const btn = document.getElementById("go");
+  btn.disabled = true;
+  append("⏳ 已提交审核意见，正在重生成…" + (feedback ? "" : "（通过并定稿）"));
+  try {
+    const resp = await fetch("/review/resume", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ thread_id: currentThreadId, feedback: feedback }),
+    });
+    if (!resp.ok) { append("❌ 续跑失败 " + resp.status + "：" + (await resp.text()), "done"); return; }
+    await consumeStream(resp);
+  } catch (e) {
+    append("❌ 续跑失败：" + e, "done");
+  } finally { btn.disabled = false; }
+}
+
+document.getElementById("go").addEventListener("click", startRun);
+document.getElementById("submitFeedback").addEventListener("click", () => {
+  resumeRun(document.getElementById("feedback").value);
 });
+document.getElementById("approve").addEventListener("click", () => resumeRun(""));
 </script>
 </body>
 </html>"""
