@@ -322,6 +322,18 @@ _WEBUI_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="graphPanel" style="display:none; margin-top:18px;">
+    <h3>🕸 引用网络（点击节点看引用关系，拖拽可调整布局）</h3>
+    <div class="row">
+      <input type="checkbox" id="hubOnly">
+      <label style="margin:0;cursor:pointer" for="hubOnly">只显示枢纽论文（hub ≥ 0.3）</label>
+      <span id="graphStat" style="margin-left:auto;color:#64748b;font-size:12px;"></span>
+    </div>
+    <svg id="graph" width="100%" height="460" style="background:#fff;border:1px solid #cbd5e1;border-radius:8px;touch-action:none;"></svg>
+    <div id="legend" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:12px;color:#475569;"></div>
+    <div id="graphInfo" style="margin-top:8px;font-size:13px;color:#1f2933;min-height:48px;line-height:1.5;"></div>
+  </div>
+
 <script>
 const log = document.getElementById("log");
 let currentThreadId = null;
@@ -351,6 +363,9 @@ function handleEvent(ev) {
     const arts = payload.artifacts || {};
     for (const k in arts) append("  " + k + ": " + arts[k]);
     document.getElementById("draft").style.display = "none";
+    if (payload.citation_graph && payload.citation_graph.nodes && payload.citation_graph.nodes.length) {
+      renderGraph(payload.citation_graph);
+    }
   } else if (stage === "error") {
     append("❌ 错误：" + payload, "done");
   } else {
@@ -434,6 +449,162 @@ async function resumeRun(feedback) {
     append("❌ 续跑失败：" + e, "done");
   } finally { btn.disabled = false; }
 }
+
+// ===== 引用网络可视化（方向 E'）=====
+let graphSim = null;       // {nodes, edges, idIndex, W, H, alpha}
+let highlightNode = -1;    // 当前选中节点 index
+let highlightSet = null;   // Set<index> 高亮集合（含邻居）
+let hubOnlyOn = false;
+let draggingNode = null;
+let dragMoved = false;
+
+const PALETTE = ["#2563eb","#dc2626","#16a34a","#d97706","#7c3aed","#0891b2","#db2777","#65a30d","#ea580c","#4f46e5","#0d9488","#ca8a04"];
+const _clusterColor = {};
+function colorFor(cluster) {
+  if (!cluster) return "#94a3b8";
+  if (_clusterColor[cluster] === undefined) {
+    const keys = Object.keys(_clusterColor);
+    _clusterColor[cluster] = PALETTE[keys.length % PALETTE.length];
+  }
+  return _clusterColor[cluster];
+}
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+function renderGraph(data) {
+  const svg = document.getElementById("graph");
+  document.getElementById("graphPanel").style.display = "block";
+  const W = svg.clientWidth || 760, H = 460;
+  const n = data.nodes.length;
+  const R = Math.min(W, H) * 0.38;
+  const nodes = data.nodes.map((d, i) => ({
+    ...d, i,
+    x: W/2 + R * Math.cos(2*Math.PI*i/n) + (Math.random()-0.5)*20,
+    y: H/2 + R * Math.sin(2*Math.PI*i/n) + (Math.random()-0.5)*20,
+    vx: 0, vy: 0, fx: null, fy: null,
+  }));
+  const idIndex = {}; nodes.forEach(nd => idIndex[nd.id] = nd.i);
+  const edges = (data.edges || []).filter(e => idIndex[e[0]]!==undefined && idIndex[e[1]]!==undefined)
+                              .map(e => [idIndex[e[0]], idIndex[e[1]]]);
+  graphSim = {nodes, edges, idIndex, W, H, alpha: 1};
+
+  const legend = document.getElementById("legend");
+  const seen = {}; let lh = "";
+  for (const nd of nodes) {
+    if (nd.cluster && !seen[nd.cluster]) { seen[nd.cluster]=1;
+      lh += '<span style="display:inline-flex;align-items:center;gap:4px;"><span style="width:11px;height:11px;border-radius:50%;background:'+colorFor(nd.cluster)+';display:inline-block"></span>'+esc(nd.cluster)+'</span>'; }
+  }
+  legend.innerHTML = lh;
+  const gaps = data.gaps || [];
+  document.getElementById("graphInfo").innerHTML = gaps.length
+    ? "<b>⚠ 研究空白候选：</b><br>" + gaps.map(g=>"• "+esc(g)).join("<br>")
+    : "提示：点击节点查看引用关系，拖拽可调整布局。";
+  document.getElementById("graphStat").textContent = nodes.length + " 篇 / " + edges.length + " 条引用边";
+  bindGraphEvents();
+  runSim();
+}
+
+function runSim() {
+  if (!graphSim) return;
+  cancelAnimationFrame(runSim._raf);
+  function step() {
+    tick(graphSim); draw(graphSim);
+    if (graphSim.alpha > 0.02 || draggingNode) runSim._raf = requestAnimationFrame(step);
+  }
+  runSim._raf = requestAnimationFrame(step);
+}
+
+function tick(s) {
+  const repel = 1400;
+  for (let i=0;i<s.nodes.length;i++){
+    const a=s.nodes[i];
+    for (let j=i+1;j<s.nodes.length;j++){
+      const b=s.nodes[j];
+      let dx=a.x-b.x, dy=a.y-b.y, d2=dx*dx+dy*dy; if(d2<1)d2=1;
+      const d=Math.sqrt(d2), f=repel/d2, fx=f*dx/d, fy=f*dy/d;
+      a.vx+=fx; a.vy+=fy; b.vx-=fx; b.vy-=fy;
+    }
+  }
+  const L=58;
+  for (const [u,v] of s.edges){
+    const a=s.nodes[u], b=s.nodes[v];
+    let dx=b.x-a.x, dy=b.y-a.y, d=Math.sqrt(dx*dx+dy*dy)||1;
+    const f=(d-L)*0.05, fx=f*dx/d, fy=f*dy/d;
+    a.vx+=fx; a.vy+=fy; b.vx-=fx; b.vy-=fy;
+  }
+  for (const nd of s.nodes){
+    if (nd.fx!==null){ nd.x=nd.fx; nd.y=nd.fy; nd.vx=0; nd.vy=0; continue; }
+    nd.vx += (s.W/2 - nd.x)*0.003; nd.vy += (s.H/2 - nd.y)*0.003;
+    nd.vx*=0.86; nd.vy*=0.86;
+    nd.x += nd.vx * s.alpha; nd.y += nd.vy * s.alpha;
+    nd.x = Math.max(12, Math.min(s.W-12, nd.x));
+    nd.y = Math.max(12, Math.min(s.H-12, nd.y));
+  }
+  s.alpha *= 0.97;
+}
+
+function draw(s) {
+  const svg = document.getElementById("graph");
+  let html = "";
+  for (const [u,v] of s.edges){
+    const a=s.nodes[u], b=s.nodes[v];
+    const on = !highlightSet || (highlightSet.has(u) && highlightSet.has(v));
+    html += '<line x1="'+a.x.toFixed(1)+'" y1="'+a.y.toFixed(1)+'" x2="'+b.x.toFixed(1)+'" y2="'+b.y.toFixed(1)+'" stroke="'+(on?'#94a3b8':'#eef2f7')+'" stroke-width="'+(on?1.3:0.5)+'"/>';
+  }
+  for (const nd of s.nodes){
+    if (hubOnlyOn && nd.hub < 0.3) continue;
+    const r = 4 + 12*Math.max(nd.hub,0);
+    const op = (!highlightSet || highlightSet.has(nd.i)) ? 1 : 0.16;
+    const sel = nd.i === highlightNode;
+    html += '<circle data-i="'+nd.i+'" cx="'+nd.x.toFixed(1)+'" cy="'+nd.y.toFixed(1)+'" r="'+r.toFixed(1)+'" fill="'+colorFor(nd.cluster)+'" fill-opacity="'+op+'" stroke="'+(sel?'#0f172a':'#fff')+'" stroke-width="'+(sel?2.5:1)+'" style="cursor:pointer"/>';
+    if (nd.hub>=0.35 || sel){
+      const t = nd.label.length>26? nd.label.slice(0,25)+"…" : nd.label;
+      html += '<text data-i="'+nd.i+'" x="'+(nd.x+r+3).toFixed(1)+'" y="'+(nd.y+3.5).toFixed(1)+'" font-size="10" fill="#334155" fill-opacity="'+op+'" style="pointer-events:none">'+esc(t)+'</text>';
+    }
+  }
+  svg.setAttribute("viewBox", "0 0 " + s.W + " " + s.H);
+  svg.innerHTML = html;
+}
+
+function bindGraphEvents() {
+  const svg = document.getElementById("graph");
+  if (svg._bound) return; svg._bound = 1;
+  function svgPoint(evt){
+    const r = svg.getBoundingClientRect();
+    const vb = (svg.getAttribute("viewBox")||("0 0 "+svg.clientWidth+" 460")).split(" ");
+    return { x: (evt.clientX - r.left) * (parseFloat(vb[2])/r.width),
+             y: (evt.clientY - r.top)  * (parseFloat(vb[3])/r.height) };
+  }
+  function nodeAt(evt){
+    const p = svgPoint(evt); let best=null, bd=1e9;
+    for (const nd of graphSim.nodes){ if(hubOnlyOn && nd.hub<0.3) continue;
+      const dx=nd.x-p.x, dy=nd.y-p.y, d=dx*dx+dy*dy, rr=(4+12*Math.max(nd.hub,0))+5;
+      if(d<rr*rr && d<bd){bd=d;best=nd;} }
+    return best;
+  }
+  svg.addEventListener("mousedown", (e)=>{ const nd=nodeAt(e); if(!nd) return; draggingNode=nd; dragMoved=false; nd.fx=nd.x; nd.fy=nd.y; });
+  window.addEventListener("mousemove", (e)=>{ if(!draggingNode) return; dragMoved=true; const p=svgPoint(e); draggingNode.fx=p.x; draggingNode.fy=p.y; graphSim.alpha=Math.max(graphSim.alpha,0.3); });
+  window.addEventListener("mouseup", ()=>{ if(!draggingNode) return; const nd=draggingNode; draggingNode=null; nd.fx=null; nd.fy=null; if(!dragMoved) selectNode(nd.i); });
+  svg.addEventListener("click", (e)=>{ if (e.target.tagName === "svg") clearHighlight(); });
+}
+
+function selectNode(i){
+  highlightNode = i;
+  const s = graphSim; const nb = new Set([i]);
+  for (const [u,v] of s.edges){ if(u===i) nb.add(v); if(v===i) nb.add(u); }
+  highlightSet = nb; draw(s);
+  const nd = s.nodes[i];
+  const outE=[], inE=[];
+  for (const [u,v] of s.edges){ if(u===i) outE.push(s.nodes[v].label); if(v===i) inE.push(s.nodes[u].label); }
+  const info = document.getElementById("graphInfo");
+  let html = "<b>"+esc(nd.label)+"</b><br>";
+  html += "年份 "+(nd.year||"-")+" ｜ 被引 "+nd.citations+" ｜ 枢纽度 "+nd.hub+" ｜ 桥接度 "+nd.bridge+" ｜ 簇："+esc(nd.cluster||"-")+"<br>";
+  if (outE.length) html += "<br><b>引用（池内 "+outE.length+"）：</b><br>" + outE.slice(0,8).map(t=>"• "+esc(t.length>40?t.slice(0,39)+"…":t)).join("<br>");
+  if (inE.length) html += "<br><b>被引（池内 "+inE.length+"）：</b><br>" + inE.slice(0,8).map(t=>"• "+esc(t.length>40?t.slice(0,39)+"…":t)).join("<br>");
+  info.innerHTML = html;
+}
+function clearHighlight(){ highlightNode=-1; highlightSet=null; if(graphSim) draw(graphSim); document.getElementById("graphInfo").innerHTML="提示：点击节点查看引用关系，拖拽可调整布局。"; }
+
+document.getElementById("hubOnly").addEventListener("change", (e)=>{ hubOnlyOn=e.target.checked; if(graphSim) draw(graphSim); });
 
 document.getElementById("go").addEventListener("click", startRun);
 document.getElementById("submitFeedback").addEventListener("click", () => {

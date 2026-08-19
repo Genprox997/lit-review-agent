@@ -952,6 +952,17 @@ def synthesizer(state: AgentState) -> dict:
     )
     paths["meta"] = str(meta_path)
 
+    # --- 引用网络可视化数据（方向 E'）：序列化供 Web UI 渲染交互式网络图 ---
+    clusters_for_graph = state.get("clusters") or []
+    gap_list = state.get("gaps") or []
+    graph_data = CG.export_graph(papers, clusters_for_graph, gap_list)
+    graph_path = out / f"{slug}_{stamp}_citation_graph.json"
+    graph_path.write_text(
+        json.dumps(graph_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    paths["citation_graph"] = str(graph_path)
+
     # --- 多格式输出（方向 C）：在 Markdown 之外按需再产出 LaTeX / docx ---
     fmt = settings.output_format
     if fmt in ("latex", "docx"):
@@ -972,6 +983,7 @@ def synthesizer(state: AgentState) -> dict:
     return {
         "report": report,
         "bibtex": bibtex,
+        "citation_graph": graph_data,
         "artifacts": {k: str(v) for k, v in paths.items()},
         "logs": [
             _log(

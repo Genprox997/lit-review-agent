@@ -170,3 +170,33 @@ def test_resume_with_feedback_triggers_rewrite_then_approve(client):
 def test_resume_bad_thread_returns_400(client):
     resp = client.post("/review/resume", json={"thread_id": "does-not-exist", "feedback": ""})
     assert resp.status_code == 400
+
+
+def test_stream_done_includes_citation_graph(client):
+    """方向 E'：done 事件应回传 citation_graph（nodes/edges），供 Web UI 渲染。"""
+    with client.stream("POST", "/review/stream", json={
+        "topic": "vision transformers", "provider": "stub", "target": 2, "with_human": False,
+    }) as resp:
+        assert resp.status_code == 200
+        events = _collect(resp)
+
+    stages = [s for s, _ in events]
+    assert "done" in stages
+    done = [p for s, p in events if s == "done"][0]
+    cg = done.get("citation_graph") or {}
+    assert cg.get("nodes"), "done 事件应携带引用网络节点"
+    assert isinstance(cg.get("edges"), list), "done 事件应携带引用网络边"
+    assert cg.get("stats") and "node_count" in cg["stats"]
+    # 假检索文献无 referenced_works -> 边为空但节点仍在（安全降级）
+    assert len(cg["nodes"]) == 2
+    assert cg["edges"] == []
+
+
+def test_webui_index_has_graph_panel(client):
+    """方向 E'：Web UI 含引用网络面板与渲染入口。"""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert 'id="graph"' in resp.text
+    assert "renderGraph" in resp.text
+    assert "引用网络" in resp.text
+    assert "hubOnly" in resp.text

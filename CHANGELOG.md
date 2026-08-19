@@ -4,6 +4,29 @@
 
 ---
 
+## 方向 E'：引用网络可视化（Web UI 交互式网络图）（2026-08-19）
+
+**目标**：把方向 D' 已算出的枢纽度（PageRank）/ 桥接度（betweenness）/ 共引空白，从成稿附录 A.8 的纯文本，升级为 Web UI 内嵌的**交互式力导向网络图**——用户点击枢纽论文即可看其引用/被引关系、各子领域以颜色区分、研究空白在图侧高亮提示，把「必引文献」与「研究空白」从静态文字变成可探索的视图。
+
+**变更内容**
+- **图数据序列化**（`src/agent/citation_graph.py`）：新增 `export_graph(papers, clusters, gaps)`，复用 `build_graph` 边，输出可 JSON 化的 `{nodes:[{id,label,year,citations,hub,bridge,cluster}], edges:[[src,dst]...], gaps, stats}`；节点按主题簇打 `cluster` 标签，统计 hub/bridge Top5；自身调用 `score_centrality` 保证枢纽/桥接分数始终有效（不依赖调用方先跑过）。无引用边时 `edges=[]`、hub/bridge 全 0，安全降级。
+- **落盘与透传**：`AgentState` 新增 `citation_graph` 字段；`synthesizer` 写出 `*_citation_graph.json` 侧车并加入 `artifacts`，同时在节点返回中携带图数据。
+- **回传前端**：`run_review` 的 `done` 事件 payload 增加 `citation_graph`，Web UI 无需二次请求即可渲染。
+- **Web UI（`src/api.py` 的 `_WEBUI_HTML`）**：新增引用网络面板（SVG + 簇图例 + 「只显示枢纽论文 hub≥0.3」筛选 + 详情框）。纯原生 JS 手搓力导向布局（斥力 + 弹簧 + 居中，rAF 收敛 + 拖拽），节点**按簇着色、按枢纽度定大小**；点击节点高亮其邻居（引用/被引）并在详情框列出池内引用/被引论文标题与年份/被引/枢纽度/桥接度；研究空白候选在详情框顶部高亮。无任何外部 CDN 依赖。
+
+**涉及文件**
+- `src/agent/citation_graph.py`：新增 `export_graph` 与 `_cluster_label_map`。
+- `src/agent/state.py`：`AgentState` 增 `citation_graph`；`initial_state` 种子 `{}`。
+- `src/agent/nodes.py`：`synthesizer` 生成并写 `citation_graph.json` 侧车 + 返回 `citation_graph`。
+- `src/agent/graph.py`：`done` 事件回传 `citation_graph`。
+- `src/api.py` 的 `_WEBUI_HTML`：引用网络面板 + 力导向渲染 JS。
+- `tests/test_citation_graph.py`：新增 3 个 `export_graph` 单测（节点/边/簇标签/gap 透传/无引用边安全降级）。
+- `tests/test_api_hitl.py`：新增 2 个测试（`done` 事件回传 `citation_graph`；`GET /` 含图面板标记 `id="graph"`/`renderGraph`）。
+
+**验证**：`pytest tests/test_citation_graph.py tests/test_api_hitl.py` 18 passed；完整离线套件 **124 passed / 2 skipped / 2 deselected**（无回归）。
+
+---
+
 ## 方向 A'：Web UI 接 HITL 反馈（2026-08-19）
 
 **目标**：把已落地的 HITL 闭环（方向 A 的 CLI `--human` 续跑）搬到浏览器——用户无需命令行，即可在网页里看草稿、提修改意见、多次迭代改稿后再一键定稿。

@@ -174,3 +174,42 @@ def test_full_graph_citation_appendix(stub_env, tmp_path, monkeypatch):
     # 最高枢纽论文应进入 top_hub
     top = (final.get("citation_analysis") or {}).get("top_hub") or []
     assert top and top[0]["title"] == "C root"
+
+
+# --------------------------------------------------------------------------
+# 方向 E'：引用网络可视化数据序列化
+# --------------------------------------------------------------------------
+def test_export_graph_returns_nodes_edges_and_stats():
+    papers = _graph_papers()
+    g = CG.export_graph(papers)
+    assert len(g["nodes"]) == 6
+    # W1 -> W2, W3 ; W2 -> W3 ; W4 -> W1 ; W5 -> W1 ; W6 -> W3
+    expected_edges = {
+        tuple(sorted(["W1", "W2"])), tuple(sorted(["W1", "W3"])),
+        tuple(sorted(["W2", "W3"])), tuple(sorted(["W4", "W1"])),
+        tuple(sorted(["W5", "W1"])), tuple(sorted(["W6", "W3"])),
+    }
+    assert {tuple(sorted(e)) for e in g["edges"]} == expected_edges
+    assert g["stats"]["node_count"] == 6
+    assert g["stats"]["edge_count"] == 6
+    # 最高枢纽应为 C root（W3）
+    assert g["stats"]["top_hub"] and g["stats"]["top_hub"][0]["id"] == "W3"
+
+
+def test_export_graph_labels_clusters_and_passes_gaps():
+    papers = _graph_papers()
+    clusters = [{"label": "聚类甲", "paper_ids": ["W1", "W2", "W3"]}]
+    g = CG.export_graph(papers, clusters, gaps=["gap: 共引子群未被覆盖"])
+    by_id = {n["id"]: n for n in g["nodes"]}
+    assert by_id["W1"]["cluster"] == "聚类甲"
+    assert by_id["W4"]["cluster"] == ""          # 未分配簇 -> 空串
+    assert by_id["W1"]["hub"] >= 0.0 and by_id["W3"]["hub"] > 0
+    assert g["gaps"] == ["gap: 共引子群未被覆盖"]
+
+
+def test_export_graph_safe_when_no_references():
+    papers = [_gp("Z1", [], title="lonely"), _gp("Z2", [], title="alone")]
+    g = CG.export_graph(papers)
+    assert g["edges"] == []
+    assert all(n["hub"] == 0 and n["bridge"] == 0 for n in g["nodes"])
+    assert g["stats"]["edge_count"] == 0

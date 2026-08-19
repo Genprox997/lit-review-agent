@@ -219,3 +219,79 @@ def cocitation_gaps(
                 + (" 等" if len(uncovered) > 3 else "")
             )
     return gaps
+
+
+def _cluster_label_map(clusters: Sequence[dict]) -> Dict[str, str]:
+    """paper_id -> 所属主题簇 label（用于可视化着色）。"""
+    m: Dict[str, str] = {}
+    for c in (clusters or []):
+        label = c.get("label") or ""
+        for pid in (c.get("paper_ids") or []):
+            m[pid] = label
+    return m
+
+
+def export_graph(
+    papers: Sequence[dict],
+    clusters: Sequence[dict] = None,
+    gaps: Sequence[str] = None,
+) -> Dict[str, Any]:
+    """序列化引用网络，供 Web UI 渲染交互式力导向图（方向 E'）。
+
+    返回结构（全部可 JSON 化，确定性）：
+    - ``nodes``：[{id, label, year, citations, hub, bridge, cluster}]；
+    - ``edges``：[[src_id, dst_id], ...]，仅含池中互相引用的边（与 ``build_graph`` 一致）；
+    - ``gaps``：研究空白描述（由 ``gap_analyzer`` 计算后透传）；
+    - ``stats``：节点/边数、hub/bridge Top5。
+
+    若论文未提供 ``referenced_works``（无引用边），``edges`` 为空、hub/bridge 均为 0，
+    等价于「无引用网络数据」的安全降级。
+    """
+    # 确保 hub/bridge 已计算（自身完备，不依赖调用方先跑过 score_centrality）
+    score_centrality(papers)
+    adj, _ = build_graph(papers)
+    cmap = _cluster_label_map(clusters)
+
+    nodes = []
+    for p in papers:
+        pid = p["paper_id"]
+        nodes.append(
+            {
+                "id": pid,
+                "label": (p.get("title") or "").strip(),
+                "year": int(p.get("year") or 0),
+                "citations": int(p.get("citation_count") or 0),
+                "hub": round(float(p.get("hub_score") or 0.0), 4),
+                "bridge": round(float(p.get("bridge_score") or 0.0), 4),
+                "cluster": cmap.get(pid, ""),
+            }
+        )
+
+    edges: List[List[str]] = []
+    for src, dsts in adj.items():
+        for d in dsts:
+            edges.append([src, d])
+
+    by_hub = sorted(nodes, key=lambda n: n["hub"], reverse=True)[:5]
+    by_bridge = sorted(nodes, key=lambda n: n["bridge"], reverse=True)[:5]
+    stats = {
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "top_hub": [
+            {"id": n["id"], "label": n["label"], "hub": n["hub"]}
+            for n in by_hub
+            if n["hub"] > 0
+        ],
+        "top_bridge": [
+            {"id": n["id"], "label": n["label"], "bridge": n["bridge"]}
+            for n in by_bridge
+            if n["bridge"] > 0
+        ],
+    }
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "gaps": list(gaps or []),
+        "stats": stats,
+    }
