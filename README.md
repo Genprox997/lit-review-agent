@@ -36,6 +36,7 @@ python -m src.main "retrieval augmented generation"
 | `*_papers.json` | 完整文献池元数据（含得分、引用编号、引用网络中心度），便于人工复核 |
 | `*_meta.json` | 成稿侧车（方向 B'）：本版各小节正文与主题簇，供下一版增量更新沿用编号与保留旧小节 |
 | `*_citation_graph.json` | 引用网络侧车（方向 E'）：`{nodes, edges, gaps, stats}`，供 Web UI 交互式网络图渲染或单独复用 |
+| `*_quality_report.json` | 质量评估侧车（方向 F'）：六维度得分、加权总分、等级、改进建议与亮点，供 Web UI 仪表盘渲染或 CI 质量门禁 |
 
 ### 示例输出
 
@@ -349,7 +350,7 @@ curl -N -X POST http://localhost:8000/review/stream \
      -d '{"topic": "diffusion models for image super-resolution", "lang": "en"}'
 ```
 
-`GET /` 是一个**单文件 Web UI**：主题输入框 + 约束框 + 实时滚动的进度日志，纯原生 JS 直接 `fetch('/review/stream')` 读 SSE，不依赖任何前端框架；勾选「启用人工审核」后还会在成稿挂起时弹出**草稿审核面板**（预览草稿全文、文献/引用/小节统计、成稿文件路径，并可填写修改意见或一键定稿）；综述完成后还会渲染**引用网络面板**（交互式力导向图，见方向 E'）。把它嵌进现有系统或本地起服务试用都很方便。
+`GET /` 是一个**单文件 Web UI**：主题输入框 + 约束框 + 实时滚动的进度日志，纯原生 JS 直接 `fetch('/review/stream')` 读 SSE，不依赖任何前端框架；勾选「启用人工审核」后还会在成稿挂起时弹出**草稿审核面板**（预览草稿全文、文献/引用/小节统计、成稿文件路径，并可填写修改意见或一键定稿）；综述完成后还会渲染**引用网络面板**（交互式力导向图，见方向 E'）与**质量评估仪表盘**（六维度评分、总分与改进建议，见方向 F'）。把它嵌进现有系统或本地起服务试用都很方便。
 
 返回结构（流式 `done` 事件与 `POST /review` 一致）：
 
@@ -404,6 +405,23 @@ open http://localhost:8000/
 
 `/review/resume` 续跑前会预校验该 `thread_id` 确处于 `human_review` 挂起态，否则返回 400（避免误触发全新运行）。同一会话内的多轮改稿共用同一 `thread_id` 与 SQLite 检查点，进程重启也不丢失。
 
+### 质量评估仪表盘（方向 F'）
+
+把散落在各模块的「质量信号」聚合成一份**结构化质量报告**，综述完成后（`done` 事件自动回传 `quality_report`）页面下方出现「📊 质量评估仪表盘」面板，定稿前一眼定位薄弱点。复用方向 B（faithfulness）+ 方向 D'/E'（引用网络）+ P3-2（claim 锚定），零新依赖：
+
+- **总分环**：加权总分（0-100）与等级 A/B/C/D，按分数着色；
+- **六维度评分条**：
+  1. **引用-论断一致性**——faithfulness 一致性得分（方向 B），低于 90% 即告警；
+  2. **引用覆盖**——含 `[n]` 标注的小节占比，低于 80% 建议补引用；
+  3. **引用网络枢纽度**——有引用边则满分，高枢纽论文被相关性闸门剔除则扣分（警告可能遗漏必引工作）；
+  4. **主题覆盖均衡**——主题簇规模均衡度，存在研究空白时降分；
+  5. **时效**——近 5 年文献占比，偏弱则建议补最新进展；
+  6. **证据锚定强度**——claim 置信度 high/medium/low 加权（P3-2）。
+- **⚠ 改进建议**：低于阈值的维度自动生成可操作建议（如「N 条论断疑似无充分支撑，建议补充引用」）；
+- **✨ 亮点**：表现优异的维度（如一致性 ≥95%）正向提示。
+
+报告同时落盘为 `<stem>_quality_report.json` 侧车，可独立复核或接入 CI 质量门禁。
+
 ---
 
 ## 可观测（LangSmith）
@@ -445,7 +463,7 @@ lit-review-agent/
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 124 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化）
+├── tests/                  # 132 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -456,11 +474,11 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 124 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化）
+pytest -m "not network"     # 132 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**、**Web UI 接 HITL 反馈（`/review/stream` 挂起回传草稿、 `/review/resume` 回填意见续跑、多轮改稿定稿闭环）**。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**、**Web UI 接 HITL 反馈（`/review/stream` 挂起回传草稿、 `/review/resume` 回填意见续跑、多轮改稿定稿闭环）**、**引用网络可视化（Web UI 交互式力导向网络图、节点着色/大小语义、点击高亮邻居、研究空白高亮）**、**质量评估仪表盘（`compute_quality_report` 六维度得分、加权总分与等级、薄弱项改进建议与亮点、`done` 事件回传、Web UI 面板渲染）**。
 
 ---
 
@@ -485,7 +503,7 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
 - 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若改用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
-> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿；**引用网络可视化（方向 E'）**——Web UI 内嵌交互式力导向网络图，点击枢纽论文看引用/被引、研究空白高亮。详见 `CHANGELOG.md`。
+> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿；**引用网络可视化（方向 E'）**——Web UI 内嵌交互式力导向网络图，点击枢纽论文看引用/被引、研究空白高亮；**质量评估仪表盘（方向 F'）**——把 faithfulness + 引用网络 + claim 锚定等信号聚合成六维度质量报告，Web UI 一键看总分与改进建议。详见 `CHANGELOG.md`。
 
 ## 路线
 
@@ -509,4 +527,5 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] **方向 B'：增量更新已有综述**（载入历史池 + 沿用编号 + 保留未变小节 + 增量说明；CLI `--incremental/--since/--base`，API 同名字段）
 - [x] **方向 A'：Web UI 接 HITL 反馈**（浏览器看草稿、提意见、多轮改稿后定稿；`/review/stream` 带 `with_human` 推送 `interrupted` 含草稿全文，`/review/resume` 回填意见续跑，强制 SQLite 检查点）
 - [x] **方向 E'：引用网络可视化**（Web UI 内嵌交互式力导向网络图：节点按簇着色/按枢纽度定大小，点击高亮邻居与引用-被引列表，研究空白高亮；`citation_graph.json` 侧车；纯原生 JS 无 CDN 依赖）
+- [x] **方向 F'：质量评估仪表盘**（聚合 faithfulness + 引用网络枢纽度 + claim 锚定等信号成六维度质量报告，Web UI 渲染总分环/评分条/改进建议，`quality_report.json` 侧车，纯函数零依赖）
 - [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
