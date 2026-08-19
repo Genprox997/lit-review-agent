@@ -35,6 +35,7 @@ python -m src.main "retrieval augmented generation"
 | `*_review.docx` | Word 成稿（`--format docx`，需 `pip install -e ".[docx]"`） |
 | `*_papers.json` | 完整文献池元数据（含得分、引用编号、引用网络中心度），便于人工复核 |
 | `*_meta.json` | 成稿侧车（方向 B'）：本版各小节正文与主题簇，供下一版增量更新沿用编号与保留旧小节 |
+| `*_citation_graph.json` | 引用网络侧车（方向 E'）：`{nodes, edges, gaps, stats}`，供 Web UI 交互式网络图渲染或单独复用 |
 
 ### 示例输出
 
@@ -348,7 +349,7 @@ curl -N -X POST http://localhost:8000/review/stream \
      -d '{"topic": "diffusion models for image super-resolution", "lang": "en"}'
 ```
 
-`GET /` 是一个**单文件 Web UI**：主题输入框 + 约束框 + 实时滚动的进度日志，纯原生 JS 直接 `fetch('/review/stream')` 读 SSE，不依赖任何前端框架；勾选「启用人工审核」后还会在成稿挂起时弹出**草稿审核面板**（预览草稿全文、文献/引用/小节统计、成稿文件路径，并可填写修改意见或一键定稿）。把它嵌进现有系统或本地起服务试用都很方便。
+`GET /` 是一个**单文件 Web UI**：主题输入框 + 约束框 + 实时滚动的进度日志，纯原生 JS 直接 `fetch('/review/stream')` 读 SSE，不依赖任何前端框架；勾选「启用人工审核」后还会在成稿挂起时弹出**草稿审核面板**（预览草稿全文、文献/引用/小节统计、成稿文件路径，并可填写修改意见或一键定稿）；综述完成后还会渲染**引用网络面板**（交互式力导向图，见方向 E'）。把它嵌进现有系统或本地起服务试用都很方便。
 
 返回结构（流式 `done` 事件与 `POST /review` 一致）：
 
@@ -382,6 +383,23 @@ curl -N -X POST http://localhost:8000/review/resume \
      -H "Content-Type: application/json" \
      -d '{"thread_id": "<上一步回传的 thread_id>",
           "feedback": "在第 1 个主题小节补充与对比方法的实验分析"}'
+```
+
+### 引用网络可视化（方向 E'）
+
+把方向 D' 算出的枢纽度 / 桥接度 / 共引空白，从成稿附录 A.8 的静态文字升级为 Web UI 内嵌的**交互式力导向网络图**。综述完成后（`done` 事件自动回传 `citation_graph`），页面下方出现「🕸 引用网络」面板：
+
+- **节点**：按主题簇着色，半径随**枢纽度（PageRank）**增大——一眼锁定必引候选；
+- **边**：池内论文间的引用关系（有向，A→B 表示 A 引用 B）；
+- **交互**：点击任意节点 → 高亮其邻居并弹详情框，列出其**池内引用 / 被引**论文标题、年份、被引数、枢纽度、桥接度；拖拽节点可调整布局；
+- **筛选**：勾选「只显示枢纽论文（hub ≥ 0.3）」聚焦核心文献；
+- **研究空白**：若方向 D' 的共引分析发现未被主题簇覆盖的子领域，在详情框顶部以「⚠ 研究空白候选」高亮提示。
+
+图数据零外部依赖：纯原生 JS 手搓的力导向布局（斥力 + 弹簧 + 居中，rAF 收敛），随 `done` 事件内联回传，无需二次请求；同时落盘为 `<stem>_citation_graph.json` 侧车，可单独复用。
+
+```bash
+# 启动后浏览器打开 GET /，发起综述，完成后下拉到「引用网络」面板即可探索
+open http://localhost:8000/
 ```
 
 `/review/resume` 续跑前会预校验该 `thread_id` 确处于 `human_review` 挂起态，否则返回 400（避免误触发全新运行）。同一会话内的多轮改稿共用同一 `thread_id` 与 SQLite 检查点，进程重启也不丢失。
@@ -427,7 +445,7 @@ lit-review-agent/
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 119 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新）
+├── tests/                  # 124 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -438,7 +456,7 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 119 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新）
+pytest -m "not network"     # 124 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
@@ -467,7 +485,7 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
 - 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若改用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
-> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿。详见 `CHANGELOG.md`。
+> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿；**引用网络可视化（方向 E'）**——Web UI 内嵌交互式力导向网络图，点击枢纽论文看引用/被引、研究空白高亮。详见 `CHANGELOG.md`。
 
 ## 路线
 
@@ -490,4 +508,5 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] **方向 D'：引用网络分析**（PageRank 枢纽度 / betweenness 桥接度识别必引与跨子领域枢纽；共引找空白；排序加枢纽度信号；附录 A.8）
 - [x] **方向 B'：增量更新已有综述**（载入历史池 + 沿用编号 + 保留未变小节 + 增量说明；CLI `--incremental/--since/--base`，API 同名字段）
 - [x] **方向 A'：Web UI 接 HITL 反馈**（浏览器看草稿、提意见、多轮改稿后定稿；`/review/stream` 带 `with_human` 推送 `interrupted` 含草稿全文，`/review/resume` 回填意见续跑，强制 SQLite 检查点）
+- [x] **方向 E'：引用网络可视化**（Web UI 内嵌交互式力导向网络图：节点按簇着色/按枢纽度定大小，点击高亮邻居与引用-被引列表，研究空白高亮；`citation_graph.json` 侧车；纯原生 JS 无 CDN 依赖）
 - [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
