@@ -332,7 +332,7 @@ curl -X POST http://localhost:8000/review \
           "base_path": "output/上次_review.md", "lang": "en"}'
 ```
 
-返回 `{topic, paper_count, citation_count, section_count, gaps, artifacts}`，`artifacts` 给出生成的 `md` / `bib` / `json` 绝对路径。API 模式默认 `with_human=False`；若 LLM 未配 key 返回 400，未生成成稿返回 422/500 并带原因。`ReviewRequest` 还支持 `incremental` / `since_date` / `base_path` 三个增量字段（方向 B'），`POST /review` 与 `POST /review/stream` 均接回。
+返回 `{topic, paper_count, citation_count, section_count, gaps, artifacts}`，`artifacts` 给出生成的 `md` / `bib` / `json` 绝对路径。API 模式默认 `with_human=False`；若 LLM 未配 key 返回 400，未生成成稿返回 422/500 并带原因。`ReviewRequest` 还支持 `incremental` / `since_date` / `base_path` 三个增量字段（方向 B'），以及 `with_human` / `thread_id` 两个 HITL 字段（方向 A'）：`with_human=True` 时成稿后挂起并推送 `interrupted` 事件（含草稿全文与 `thread_id`），由 `POST /review/resume` 回填意见续跑。`POST /review` 与 `POST /review/stream` 均接回上述字段。
 
 ### 流式 API + 自包含 Web UI（P3-3）
 
@@ -348,7 +348,7 @@ curl -N -X POST http://localhost:8000/review/stream \
      -d '{"topic": "diffusion models for image super-resolution", "lang": "en"}'
 ```
 
-`GET /` 是一个**单文件 Web UI**：一个主题输入框 + 约束框 + 实时滚动的进度日志，纯原生 JS 直接 `fetch('/review/stream')` 读 SSE，不依赖任何前端框架。把它嵌进现有系统或本地起服务试用都很方便。
+`GET /` 是一个**单文件 Web UI**：主题输入框 + 约束框 + 实时滚动的进度日志，纯原生 JS 直接 `fetch('/review/stream')` 读 SSE，不依赖任何前端框架；勾选「启用人工审核」后还会在成稿挂起时弹出**草稿审核面板**（预览草稿全文、文献/引用/小节统计、成稿文件路径，并可填写修改意见或一键定稿）。把它嵌进现有系统或本地起服务试用都很方便。
 
 返回结构（流式 `done` 事件与 `POST /review` 一致）：
 
@@ -360,6 +360,31 @@ curl -N -X POST http://localhost:8000/review/stream \
   "artifacts": {"report": ".../review.md", "bibtex": ".../references.bib", "papers": ".../papers.json"}
 }
 ```
+
+### 人工审核（HITL）接入 Web UI（方向 A'）
+
+把方向 A 的 CLI `--human` 续跑能力搬到浏览器：无需命令行即可「看草稿 → 提意见 → 多轮改稿 → 定稿」。
+
+**流程**
+1. 前端勾选「启用人工审核」后，`POST /review/stream` 带 `with_human=true` 发起；图在 `human_review` 处挂起（强制 SQLite 检查点），接口推送 `interrupted` 事件，载荷含 `thread_id`、`report`（草稿全文）与统计；
+2. 前端展示草稿与意见输入框；用户点「提交修改意见并重生成」→ `POST /review/resume`（带 `thread_id` + `feedback`）以 `Command(resume=feedback)` 续跑，非空意见触发方向 A 的**针对性改写回环**并再次挂起；点「通过并定稿」→ 同一端点传空 `feedback` 直接定稿（`done`）；
+3. 支持多轮迭代，最终 `done` 事件给出产物路径。
+
+```bash
+# 1) 发起并挂起（with_human=true）；interrupted 事件回传 thread_id 与草稿全文
+curl -N -X POST http://localhost:8000/review/stream \
+     -H "Content-Type: application/json" \
+     -d '{"topic": "diffusion models for image super-resolution",
+          "with_human": true, "lang": "en"}'
+
+# 2) 回填意见续跑（非空 → 针对性改写后再次挂起；空 → 直接定稿）
+curl -N -X POST http://localhost:8000/review/resume \
+     -H "Content-Type: application/json" \
+     -d '{"thread_id": "<上一步回传的 thread_id>",
+          "feedback": "在第 1 个主题小节补充与对比方法的实验分析"}'
+```
+
+`/review/resume` 续跑前会预校验该 `thread_id` 确处于 `human_review` 挂起态，否则返回 400（避免误触发全新运行）。同一会话内的多轮改稿共用同一 `thread_id` 与 SQLite 检查点，进程重启也不丢失。
 
 ---
 
@@ -402,7 +427,7 @@ lit-review-agent/
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 114 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新）
+├── tests/                  # 119 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -413,11 +438,11 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 114 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、faithfulness、多格式输出、引用网络分析、增量更新）
+pytest -m "not network"     # 119 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**、**Web UI 接 HITL 反馈（`/review/stream` 挂起回传草稿、 `/review/resume` 回填意见续跑、多轮改稿定稿闭环）**。
 
 ---
 
@@ -442,7 +467,7 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
 - 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若改用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
-> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成。详见 `CHANGELOG.md`。
+> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿。详见 `CHANGELOG.md`。
 
 ## 路线
 
@@ -464,4 +489,5 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] **方向 C：多格式成稿输出**（LaTeX `.tex` 可编译 + Word `.docx`，`--format` / `OUTPUT_FORMAT` 切换）
 - [x] **方向 D'：引用网络分析**（PageRank 枢纽度 / betweenness 桥接度识别必引与跨子领域枢纽；共引找空白；排序加枢纽度信号；附录 A.8）
 - [x] **方向 B'：增量更新已有综述**（载入历史池 + 沿用编号 + 保留未变小节 + 增量说明；CLI `--incremental/--since/--base`，API 同名字段）
+- [x] **方向 A'：Web UI 接 HITL 反馈**（浏览器看草稿、提意见、多轮改稿后定稿；`/review/stream` 带 `with_human` 推送 `interrupted` 含草稿全文，`/review/resume` 回填意见续跑，强制 SQLite 检查点）
 - [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
