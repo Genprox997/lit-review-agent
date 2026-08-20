@@ -43,6 +43,31 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         return True
     return "429" in str(exc) and ("rate" in str(exc).lower() or "limit" in str(exc).lower())
 
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """判断异常是否属于「瞬时故障」，值得指数退避重试（方向 G'）。
+
+    覆盖三类：
+    - 429 限流（兼容 OpenAI / langchain 包装）；
+    - 5xx 服务端错误（APIStatusError 且状态码 >= 500）；
+    - 连接/超时/重置等网络瞬时故障（按异常类型与异常文本兜底，
+      避免依赖具体 provider 的异常类层次）。
+    """
+    if _is_rate_limit_error(exc):
+        return True
+    if APIStatusError is not None and isinstance(exc, APIStatusError):
+        return getattr(exc, "status_code", 0) >= 500
+    text = str(exc).lower()
+    return any(
+        k in text
+        for k in (
+            "timeout", "timed out", "connection", "reset by peer",
+            "econnreset", "broken pipe", "temporarily",
+            "503", "502", "504", "500",
+            "service unavailable", "gateway timeout", "bad gateway",
+        )
+    )
+
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
@@ -327,13 +352,13 @@ def chat(
         try:
             resp = model.invoke(messages)
             break
-        except Exception as exc:  # noqa: BLE001 - 需区分限流与其他错误
-            if _is_rate_limit_error(exc):
+        except Exception as exc:  # noqa: BLE001 - 需区分瞬时故障与其他错误
+            if _is_retryable_error(exc):
                 last_exc = exc
                 backoff = 2 ** attempt * 5  # 5s, 10s, 20s ...
                 logger.warning(
-                    "[%s] LLM 触发 429 限流，%ds 后重试（第 %d/%d 次）",
-                    node, backoff, attempt + 1, max_retries,
+                    "[%s] LLM 触发瞬时故障（%s），%ds 后重试（第 %d/%d 次）",
+                    node, type(exc).__name__, backoff, attempt + 1, max_retries,
                 )
                 if attempt < max_retries:
                     time.sleep(backoff)

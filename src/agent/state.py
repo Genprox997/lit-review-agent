@@ -83,6 +83,8 @@ class AgentState(TypedDict, total=False):
     citation_analysis: Dict[str, Any]           # 引用网络分析（方向 D'）：枢纽/桥接论文、告警
     citation_graph: Dict[str, Any]              # 引用网络可视化数据（方向 E'）：nodes/edges/gaps/stats
     quality_report: Dict[str, Any]              # 质量评估仪表盘（方向 F'）：各维度得分、总分、薄弱项
+    run_errors: Annotated[List[Dict[str, Any]], operator.add]  # 长任务健壮性（方向 G'）：节点级错误累积
+    timed_out: bool                             # 是否触发超时看门狗（方向 G'）
 
     # ---- 增量更新（方向 B'）----
     incremental: bool                         # 是否增量更新模式
@@ -138,6 +140,8 @@ def initial_state(
         "citation_analysis": {},
         "citation_graph": {},
         "quality_report": {},
+        "run_errors": [],
+        "timed_out": False,
         "report": "",
         "bibtex": "",
         "artifacts": {},

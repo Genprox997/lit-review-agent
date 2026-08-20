@@ -144,6 +144,11 @@ class Settings:
     http_cache_enabled: bool = field(default_factory=lambda: _env_bool("HTTP_CACHE_ENABLED", True))
     http_cache_ttl_days: float = field(default_factory=lambda: _env_float("HTTP_CACHE_TTL_DAYS", 7.0))
 
+    # ---- 长任务健壮性（方向 G'）----
+    run_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("RUN_TIMEOUT_SECONDS", 1800)
+    )
+
     # ---- 可观测（LangSmith，可选）----
     langsmith_api_key: str = field(default_factory=lambda: _env("LANGSMITH_API_KEY"))
     langsmith_project: str = field(default_factory=lambda: _env("LANGSMITH_PROJECT", "lit-review-agent"))

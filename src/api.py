@@ -177,6 +177,8 @@ def create_app():
             "section_count": len(final.get("sections") or {}),
             "gaps": final.get("gaps") or [],
             "artifacts": artifacts,
+            "errors": final.get("run_errors") or [],
+            "timed_out": final.get("timed_out", False),
         }
 
     @app.post("/review/stream", response_model=None)
@@ -348,6 +350,11 @@ _WEBUI_HTML = """<!DOCTYPE html>
     <div id="qHigh" style="margin-top:8px;"></div>
   </div>
 
+  <div id="runAlertPanel" style="display:none; margin-top:18px;">
+    <h3>⚠ 运行告警（长任务健壮性）</h3>
+    <div id="runAlertBody"></div>
+  </div>
+
 <script>
 const log = document.getElementById("log");
 let currentThreadId = null;
@@ -382,6 +389,11 @@ function handleEvent(ev) {
     }
     if (payload.quality_report && typeof payload.quality_report === "object") {
       renderQuality(payload.quality_report);
+    }
+    if (payload.errors && payload.errors.length) {
+      renderAlerts(payload.errors, payload.timed_out);
+    } else if (payload.timed_out) {
+      renderAlerts([], true);
     }
   } else if (stage === "error") {
     append("❌ 错误：" + payload, "done");
@@ -537,6 +549,29 @@ function renderQuality(r) {
       '<ul style="margin:0;padding-left:18px;font-size:13px;color:#166534;line-height:1.6;">' +
       high.map(h => '<li>' + esc(h) + '</li>').join("") + '</ul></div>'
     : "";
+}
+
+// ===== 运行告警（方向 G'）=====
+function renderAlerts(errors, timedOut) {
+  const panel = document.getElementById("runAlertPanel");
+  const body = document.getElementById("runAlertBody");
+  if ((!errors || !errors.length) && !timedOut) { panel.style.display = "none"; return; }
+  panel.style.display = "block";
+  let html = "";
+  if (timedOut) {
+    html += '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;color:#92400e;font-size:13px;line-height:1.6;">'
+          + '⏱ <b>本次运行触发超时看门狗</b>：部分阶段可能未完成，已生成最佳努力成稿，结论与引用以实际完成的阶段为准，必要时请缩短主题范围或提高超时上限重跑。</div>';
+  }
+  if (errors && errors.length) {
+    html += '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:10px 12px;margin-top:8px;">'
+          + '<div style="font-weight:700;color:#b91c1c;margin-bottom:6px;">节点级错误（已降级继续，共 ' + errors.length + ' 条）</div>'
+          + '<ul style="margin:0;padding-left:18px;font-size:12px;color:#7f1d1d;line-height:1.6;">'
+          + errors.slice(0, 30).map(function (e) {
+              return '<li><b>' + esc(e.node) + '</b> · ' + esc(e.time || "") + ' — ' + esc((e.kind || "") + ": " + (e.error || "")) + '</li>';
+            }).join("")
+          + '</ul></div>';
+  }
+  body.innerHTML = html;
 }
 
 // ===== 引用网络可视化（方向 E'）=====

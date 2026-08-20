@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from typing import Any, Callable, Dict, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -39,6 +40,7 @@ from src.agent.nodes import (
     skip_human_review,
     synthesizer,
 )
+from src.agent.robust import node_guard
 from src.agent.state import AgentState, initial_state
 from src.config import get_settings
 
@@ -112,23 +114,28 @@ def build_graph(
     """
     builder = StateGraph(AgentState)
 
-    builder.add_node("query_expander", query_expander)
-    builder.add_node("retriever", retriever)
-    builder.add_node("ranker", ranker)
-    builder.add_node("extractor", extractor)
-    builder.add_node("clusterer", clusterer)
-    builder.add_node("incremental_plan", incremental_plan)  # 方向 B'：增量更新规划
-    builder.add_node("section_writer", section_writer)
-    builder.add_node("ground_claims", ground_claims)
-    builder.add_node("critic", critic)
-    builder.add_node("gap_analyzer", gap_analyzer)
-    builder.add_node("faithfulness", faithfulness)
+    # 方向 G'：除最后的 synthesizer（定稿失败应直接报错而非静默）外，
+    # 所有节点都包一层 node_guard，单点失败降级继续而非中断整条长任务。
+    builder.add_node("query_expander", node_guard("query_expander", query_expander))
+    builder.add_node("retriever", node_guard("retriever", retriever))
+    builder.add_node("ranker", node_guard("ranker", ranker))
+    builder.add_node("extractor", node_guard("extractor", extractor))
+    builder.add_node("clusterer", node_guard("clusterer", clusterer))
+    builder.add_node("incremental_plan", node_guard("incremental_plan", incremental_plan))  # 方向 B'
+    builder.add_node("section_writer", node_guard("section_writer", section_writer))
+    builder.add_node("ground_claims", node_guard("ground_claims", ground_claims))
+    builder.add_node("critic", node_guard("critic", critic))
+    builder.add_node("gap_analyzer", node_guard("gap_analyzer", gap_analyzer))
+    builder.add_node("faithfulness", node_guard("faithfulness", faithfulness))
     builder.add_node("synthesizer", synthesizer)
     # 仅在启用 --human 时挂起等待审核；否则用占位节点直接放行（避免无谓中断）
-    builder.add_node("human_review", human_review if with_human else skip_human_review)
+    builder.add_node(
+        "human_review",
+        node_guard("human_review", human_review if with_human else skip_human_review),
+    )
     # 方向 A：人工意见解析 + 针对性重写（仅在收到意见时由 route_after_human 触发）
-    builder.add_node("parse_human_feedback", parse_human_feedback)
-    builder.add_node("rewrite_sections", rewrite_sections)
+    builder.add_node("parse_human_feedback", node_guard("parse_human_feedback", parse_human_feedback))
+    builder.add_node("rewrite_sections", node_guard("rewrite_sections", rewrite_sections))
 
     builder.add_edge(START, "query_expander")
     builder.add_edge("query_expander", "retriever")
@@ -209,6 +216,58 @@ def _default_checkpointer(with_human: bool = False):
 
 
 # ==========================================================================
+# 长任务健壮性（方向 G'）：超时看门狗的最佳努力定稿
+# ==========================================================================
+def _finalize_best_effort(state: AgentState, settings: Any) -> AgentState:
+    """超时后，用当前 partial state 直接调 synthesizer 产出一个可用成稿。
+
+    即使某些前期阶段（检索/抽取/成稿小节）因超时未跑完，只要还有部分
+    papers/sections，就拼出一份「最佳努力」综述，避免长任务被困数分钟后
+    颗粒无收。synthesizer 自身异常时退回极简占位成稿并记录错误。
+    """
+    state = dict(state)
+    state["timed_out"] = True
+    state.setdefault("run_errors", []).append({
+        "node": "watchdog",
+        "error": (
+            f"运行超过 RUN_TIMEOUT_SECONDS={getattr(settings, 'run_timeout_seconds', '?')}s，"
+            f"已生成最佳努力成稿（部分阶段可能未完成）"
+        ),
+        "kind": "TimeoutWatchdog",
+        "time": time.strftime("%H:%M:%S"),
+    })
+    try:
+        from src.agent.nodes import synthesizer as _synth
+        extra = _synth(state)
+    except Exception as exc:  # noqa: BLE001 - 定稿也失败，退回极简成稿
+        logger.exception("超时最佳努力定稿失败")
+        state["report"] = (
+            f"# {state.get('topic', '')} —— 文献综述（最佳努力，定稿失败）\n\n"
+            "本次运行触发长任务超时看门狗，且最终定稿失败，无法产出完整成稿。"
+        )
+        state["bibtex"] = ""
+        state["artifacts"] = {}
+        state.setdefault("run_errors", []).append({
+            "node": "synthesizer",
+            "error": f"最佳努力定稿失败：{str(exc)[:400]}",
+            "kind": type(exc).__name__,
+            "time": time.strftime("%H:%M:%S"),
+        })
+        return state
+
+    for k in ("report", "bibtex", "citation_graph", "quality_report"):
+        if k in extra:
+            state[k] = extra[k]
+    arts = dict(state.get("artifacts") or {})
+    arts.update(extra.get("artifacts") or {})
+    state["artifacts"] = arts
+    existing = list(state.get("logs") or [])
+    existing += extra.get("logs", [])
+    state["logs"] = existing
+    return state
+
+
+# ==========================================================================
 # 便捷入口
 # ==========================================================================
 def run_review(
@@ -233,6 +292,7 @@ def run_review(
     """
     graph = build_graph(with_human=with_human)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 80}
+    settings = get_settings()
 
     if feedback is not None:
         # 续跑：先确认该 thread 确实处于 human_review 挂起态，避免误操作全新线程
@@ -261,6 +321,12 @@ def run_review(
 
     interrupted = False
     final: AgentState = {}
+    # 方向 G'：长任务超时看门狗。deadline 之后立即跳出流式循环，
+    # 用已产出的 partial state 做最佳努力定稿，而不是无限期挂死。
+    deadline: Optional[float] = None
+    if settings.run_timeout_seconds and settings.run_timeout_seconds > 0:
+        deadline = time.monotonic() + settings.run_timeout_seconds
+
     for chunk in graph.stream(initial_input, config, stream_mode="values"):  # type: ignore[arg-type]
         if "__interrupt__" in chunk:
             interrupted = True
@@ -285,9 +351,22 @@ def run_review(
             print(logs[-1], flush=True)
             if on_progress:
                 on_progress("progress", logs[-1])
+        # 看门狗：超过 deadline 且尚未挂起 → 跳出，做最佳努力定稿
+        if deadline and not interrupted and time.monotonic() > deadline:
+            logger.warning(
+                "运行超过 %ds，触发长任务超时看门狗，改为最佳努力定稿",
+                settings.run_timeout_seconds,
+            )
+            break
 
     final = dict(final)  # type: ignore[arg-type]
     final["interrupted"] = interrupted
+    # 因超时被打断：用 partial state 产出可用成稿（置 timed_out）
+    if deadline and not interrupted and time.monotonic() > deadline:
+        final = _finalize_best_effort(final, settings)
+        if on_progress:
+            on_progress("progress", "⏱ 运行超时，已生成最佳努力成稿")
+
     if on_progress:
         if interrupted:
             on_progress(
@@ -311,6 +390,8 @@ def run_review(
                     "artifacts": final.get("artifacts") or {},
                     "citation_graph": final.get("citation_graph") or {},
                     "quality_report": final.get("quality_report") or {},
+                    "errors": final.get("run_errors") or [],
+                    "timed_out": final.get("timed_out", False),
                 },
             )
     return final

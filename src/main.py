@@ -71,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     g3.add_argument("--no-http-cache", action="store_true",
                     help="禁用检索 HTTP 磁盘缓存，每次都重新打学术 API")
     g3.add_argument("--print-graph", action="store_true", help="打印状态机结构后退出")
+    g3.add_argument("--run-timeout", type=int, default=None,
+                    help="长任务超时上限（秒，默认 1800）；超时后生成最佳努力成稿；0=关闭")
     g3.add_argument("-v", "--verbose", action="store_true", help="输出 DEBUG 日志")
 
     g4 = p.add_argument_group("增量更新（方向 B'）")
@@ -97,6 +99,7 @@ def _apply_overrides(args: argparse.Namespace) -> None:
         "MAX_CRITIC_ROUNDS": args.critic_rounds,
         "OUTPUT_DIR": args.output,
         "OUTPUT_FORMAT": args.format,
+        "RUN_TIMEOUT_SECONDS": args.run_timeout,
     }
     for key, value in mapping.items():
         if value is not None:
@@ -227,6 +230,16 @@ def main(argv: list[str] | None = None) -> int:
     for name, path in artifacts.items():
         print(f"  {name:10}: {Path(path).resolve()}")
     print("=" * 72)
+
+    # 长任务健壮性（方向 G'）：在终态汇总里提示降级/看门狗
+    run_errors = final.get("run_errors") or []
+    if final.get("timed_out"):
+        print("\n[⏱ 超时] 本次运行触发超时看门狗，已生成最佳努力成稿"
+              "（部分阶段可能未完成，结论与引用以实际完成的阶段为准）。")
+    if run_errors:
+        print(f"\n[⚠ 告警] 运行期间 {len(run_errors)} 个节点出错但已降级继续：")
+        for e in run_errors[:10]:
+            print(f"   - {e.get('node')} · {e.get('kind', '')}: {e.get('error', '')}")
     return 0
 
 

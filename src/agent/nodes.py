@@ -1188,6 +1188,26 @@ def _assemble_markdown(
             for d in dropped:
                 appendix.append(f"  - {d.get('title', '')} — 枢纽度 {d.get('hub')}")
 
+    # A.9 长任务健壮性（方向 G'）：运行告警与超时，让降级/看门狗可追溯
+    run_errors = state.get("run_errors") or []
+    if run_errors or state.get("timed_out"):
+        appendix.append("\n### A.9 运行告警（长任务健壮性）\n")
+        if state.get("timed_out"):
+            appendix.append(
+                "- ⏱ **本次运行触发超时看门狗**：部分阶段可能未完成，已生成最佳努力成稿，"
+                "以下结论与引用以实际完成的阶段为准，必要时请缩短主题范围或提高超时上限重跑。"
+            )
+        if run_errors:
+            appendix.append(
+                f"- 运行期间共记录 **{len(run_errors)}** 条节点级错误"
+                f"（已降级继续，未中断流水线）："
+            )
+            for e in run_errors[:30]:
+                appendix.append(
+                    f"  - [{e.get('node', '?')} · {e.get('time', '')}] "
+                    f"{e.get('kind', '')}: {e.get('error', '')}"
+                )
+
     parts.append("\n".join(appendix))
 
     return "\n\n".join(parts) + "\n"

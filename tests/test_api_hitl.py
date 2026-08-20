@@ -235,3 +235,42 @@ def test_webui_index_has_quality_panel(client):
     assert "质量评估仪表盘" in resp.text
     assert 'id="qRing"' in resp.text
     assert 'id="qWeak"' in resp.text
+
+
+def test_webui_index_has_run_alert_panel(client):
+    """方向 G'：Web UI 含长任务运行告警面板与渲染入口。"""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert 'id="runAlertPanel"' in resp.text
+    assert "renderAlerts" in resp.text
+    assert "运行告警" in resp.text
+
+
+def test_stream_done_includes_errors(client):
+    """方向 G'：done 事件应回传 errors 与 timed_out，供 Web UI 渲染运行告警。"""
+    with client.stream("POST", "/review/stream", json={
+        "topic": "vision transformers", "provider": "stub", "target": 2, "with_human": False,
+    }) as resp:
+        assert resp.status_code == 200
+        events = _collect(resp)
+
+    stages = [s for s, _ in events]
+    assert "done" in stages
+    done = [p for s, p in events if s == "done"][0]
+    assert "errors" in done, "done 事件应携带运行错误列表"
+    assert "timed_out" in done, "done 事件应携带超时标志"
+    assert isinstance(done["errors"], list)
+    assert done["timed_out"] is False  # 正常跑完不超时
+
+
+def test_review_response_includes_errors_and_timed_out(client):
+    """方向 G'：POST /review 非流式响应应回传 errors 与 timed_out 字段。"""
+    resp = client.post("/review", json={
+        "topic": "vision transformers", "provider": "stub", "target": 2,
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "errors" in body
+    assert "timed_out" in body
+    assert isinstance(body["errors"], list)
+    assert body["timed_out"] is False

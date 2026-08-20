@@ -4,6 +4,38 @@
 
 ---
 
+## 方向 G'：长任务健壮性（节点级错误隔离 + 超时看门狗 + 运行告警）（2026-08-20）
+
+**目标**：让综述流水线在「节点偶发失败 / LLM 瞬时故障 / 运行过久」三类长任务常见风险下**不白跑、不崩溃、可追溯**——单点失败降级继续而非中断整条流水线；LLM 瞬时错误（429 / 5xx / 连接重置 / 超时）自动退避重试；运行超过上限则中断并产出「最佳努力成稿」；所有降级/超时都在成稿附录、Web UI 面板、API 响应与 CLI 汇总里**显式呈现**，便于事后复核。
+
+**变更内容**
+- **节点级错误隔离**（`src/agent/robust.py` 新 + `src/agent/graph.py`）：新增 `node_guard(name, fn)`，包裹除 `synthesizer`（定稿失败应直接暴露而非静默）外的所有节点。节点抛异常时捕获 → 记一条结构化错误 `{node, error, kind, time}` 进 `state["run_errors"]`（带 `operator.add` reducer 跨节点累积）+ 打人类可读降级日志 + 返回安全空更新让图继续。`GraphInterrupt`（HITL 挂起信号）原样透传，绝不吞掉。
+- **LLM 瞬时错误重试**（`src/agent/llm.py`）：新增 `_is_retryable_error`，把重试判定从「仅 429」扩展为 429 限流 + 5xx 服务端错误 + 连接/超时/重置等网络瞬时故障（按异常类型与文本兜底）；`chat()` 重试循环改用它，退避策略不变，stub 不受影响。
+- **超时看门狗（最佳努力定稿）**（`src/agent/graph.py` + `src/config.py`）：`run_review` 流式路径新增 `deadline`（`RUN_TIMEOUT_SECONDS`，默认 1800s，0=关闭）；每次 chunk 后检查，超时则中断流式循环并调 `_finalize_best_effort`——用已产出的 partial state 直接 `synthesizer` 产出可用成稿，置 `timed_out=True` 并记录 watchdog 错误；synthesizer 自身也失败时退回极简占位成稿（仍记录错误）。
+- **全链路运行告警**：
+  - `AgentState` 新增 `run_errors`（reducer 累积）与 `timed_out` 字段，`initial_state` 种子。
+  - 成稿附录 **A.9 运行告警**（方向 G'）（`src/agent/nodes.py` 的 `_assemble_markdown`）：超时有独立提示，节点级错误逐条列出「节点 · 时间 · 类型 · 错误」。
+  - Web UI（`src/api.py` 的 `_WEBUI_HTML`）：新增「⚠ 运行告警」面板 + `renderAlerts` 渲染（橙色超时提示 + 红色节点错误卡片），`done` 事件携带 `errors` 与 `timed_out`。
+  - API：`POST /review` 响应补充 `errors` 与 `timed_out` 字段；`done` 事件携带 `errors`/`timed_out`。
+  - CLI（`src/main.py`）：新增 `--run-timeout` 选项（秒，0=关闭）；终态汇总打印超时提示与节点级错误（含节点名/类型/错误摘要）。
+- **修复**：`run_review` 此前引用未定义的 `settings` 变量（看门狗代码路径会 `NameError`），已补 `settings = get_settings()`。
+
+**涉及文件**
+- `src/agent/robust.py`：新增 `node_guard`（捕获 `GraphInterrupt` 透传、其余异常降级）。
+- `src/agent/graph.py`：所有节点（除 synthesizer）包 `node_guard`；`run_review` 补 `settings`、加 `deadline` 看门狗 + `_finalize_best_effort`；`done` 事件回传 `errors`/`timed_out`。
+- `src/agent/llm.py`：新增 `_is_retryable_error`；`chat()` 重试循环改用之。
+- `src/agent/state.py`：`AgentState` 增 `run_errors`/`timed_out`；`initial_state` 种子。
+- `src/agent/nodes.py`：附录 A.9 渲染运行告警；`synthesizer` 经 `run_errors` 累积（节点包裹后状态自带）。
+- `src/config.py`：新增 `run_timeout_seconds`（默认 1800）。
+- `src/main.py`：新增 `--run-timeout`；终态汇总打印运行告警。
+- `src/api.py` 的 `_WEBUI_HTML`：运行告警面板 + `renderAlerts`；`POST /review` 加 `errors`/`timed_out`。
+- `tests/test_robust.py`：新增 7 个测试（node_guard 隔离/透传/透传成功；retryable 分类；单节点失败端到端仍成稿并记 run_errors；超时看门狗最佳努力成稿；关闭超时正常跑完）。
+- `tests/test_api_hitl.py`：新增 2 个测试（`done` 事件回传 `errors`/`timed_out`；`GET /` 含运行告警面板标记；`POST /review` 响应含 `errors`/`timed_out`）。
+
+**验证**：`pytest tests/test_robust.py tests/test_api_hitl.py` 19 passed；完整离线套件 **139 passed / 2 skipped / 2 deselected**（无回归）。
+
+---
+
 ## 方向 E'：引用网络可视化（Web UI 交互式网络图）（2026-08-19）
 
 **目标**：把方向 D' 已算出的枢纽度（PageRank）/ 桥接度（betweenness）/ 共引空白，从成稿附录 A.8 的纯文本，升级为 Web UI 内嵌的**交互式力导向网络图**——用户点击枢纽论文即可看其引用/被引关系、各子领域以颜色区分、研究空白在图侧高亮提示，把「必引文献」与「研究空白」从静态文字变成可探索的视图。

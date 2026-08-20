@@ -29,7 +29,7 @@ python -m src.main "retrieval augmented generation"
 
 | 文件 | 内容 |
 |------|------|
-| `*_review.md` | 综述正文（内联 `[n]` 引用 + 参考文献表 + 生成过程附录，含 A.6 证据锚定、A.7 一致性校验） |
+| `*_review.md` | 综述正文（内联 `[n]` 引用 + 参考文献表 + 生成过程附录，含 A.6 证据锚定、A.7 一致性校验、A.8 引用网络分析、A.9 运行告警） |
 | `*_references.bib` | BibTeX，可直接进 LaTeX |
 | `*_review.tex` | 可编译 LaTeX 成稿（`--format latex`；`[n]` 转为 `\cite{key}`，配合同目录 `.bib`） |
 | `*_review.docx` | Word 成稿（`--format docx`，需 `pip install -e ".[docx]"`） |
@@ -220,6 +220,7 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 | `LLM_MAX_WORKERS` | `4` | LLM 调用并发线程数（P3-4）：Extractor / SectionWriter / GroundClaims 的批量调用并行执行，缩短端到端时延 |
 | `HTTP_CACHE_ENABLED` | `true` | 检索 GET 响应磁盘缓存开关（P3-4）：命中则跳过网络，省学术 API 配额 |
 | `HTTP_CACHE_TTL_DAYS` | `7` | 缓存有效期（天）；过期自动回源重取 |
+| `RUN_TIMEOUT_SECONDS` | `1800` | 长任务超时上限（秒）：超过则中断流式循环并产出「最佳努力成稿」；`0` 关闭看门狗 |
 | `CITATION_HUB_WEIGHT` | `0.10` | 引用网络枢纽度（PageRank）在综合排序中的权重（方向 D'）；无引用数据时恒为 0 |
 | `INCREMENTAL_DEFAULT_DAYS` | `180` | 增量更新未给 `--since` 时的默认回看窗口（天），仅增量模式生效（方向 B'） |
 
@@ -266,6 +267,7 @@ python -m src.main <主题> [选项]
   --thread-id xxx               检查点线程 ID，同名可断点续跑
   --dry-run                     离线试跑：stub LLM + 不下载 PDF（仅验证流程）
   --print-graph                 打印状态机结构
+  --run-timeout 1800            长任务超时上限（秒，0=关闭）；超时后产出最佳努力成稿
   --no-store                   不读写本地持久化文献池（跨主题复用失效，每次重新检索）
   --no-http-cache               禁用检索 HTTP 磁盘缓存，每次都重新打学术 API
   -v, --verbose                 DEBUG 日志
@@ -422,6 +424,21 @@ open http://localhost:8000/
 
 报告同时落盘为 `<stem>_quality_report.json` 侧车，可独立复核或接入 CI 质量门禁。
 
+### 长任务健壮性（方向 G'）
+
+综述流水线跑得越久，越容易撞上三类长任务风险：**单节点偶发失败 / LLM 瞬时故障 / 运行过久**。方向 G' 让它在这些情况下**不白跑、不崩溃、可追溯**：
+
+- **节点级错误隔离**：除定稿节点 `Synthesizer` 外的所有节点都被 `node_guard` 包裹。某节点抛异常时不再中断整条流水线，而是记一条结构化错误 `{节点, 错误, 类型, 时间}` 进 `run_errors`（跨节点累积），打人类可读降级日志，返回安全空更新让图继续，最终仍产出成稿。`Human-in-the-loop` 的 `interrupt()` 挂起信号被原样透传，绝不吞掉。
+- **LLM 瞬时错误退避重试**：`chat()` 的重试判定从「仅 429」扩展为**429 限流 + 5xx 服务端错误 + 连接/超时/重置等网络瞬时故障**（按异常类型与文本兜底），指数退避重试；客户端 4xx（如 400/404）不重试；stub 模式无影响。
+- **超时看门狗（最佳努力定稿）**：`run_review` 流式路径按 `RUN_TIMEOUT_SECONDS`（默认 1800s，`0`=关闭）设 `deadline`；每次产出 chunk 后检查，超时则中断循环并用已产出的 partial state 直接调 `Synthesizer` 产出**可用成稿**（置 `timed_out=True` 并记录 watchdog 错误）；即使定稿本身失败也退回极简占位成稿（仍记录错误）。
+- **全链路运行告警**：所有降级/超时在四处显式呈现——
+  - **成稿附录 A.9「运行告警」**：超时有独立橙色提示，节点级错误逐条列出「节点 · 时间 · 类型 · 错误」；
+  - **Web UI**：`done` 事件携带 `errors` 与 `timed_out`，页面下方新增「⚠ 运行告警」面板（超时橙色卡片 + 节点错误红色卡片）；
+  - **API**：`POST /review` 响应与 `done` 事件均含 `errors` / `timed_out`；
+  - **CLI**：终态汇总打印超时提示与节点级错误（含节点名/类型/错误摘要），新增 `--run-timeout` 选项覆盖看门狗上限。
+
+> 适用场景：`TARGET_PAPER_COUNT` 调很大、或主题很偏导致某源频繁报错/超时（如 PubMed 偶发 5xx、OpenAlex 限流）时，图不再颗粒无收，而是降级产出最佳努力成稿并把每处失败摆在台面上。
+
 ---
 
 ## 可观测（LangSmith）
@@ -447,7 +464,8 @@ lit-review-agent/
 │   │   ├── nodes.py        # 14 个节点实现（含 Faithfulness / ParseHumanFeedback / RewriteSections）
 │   │   ├── tools.py        # 多源检索、去重、排序、全文获取
 │   │   ├── prompts.py      # 各节点提示词
-│   │   └── llm.py          # 统一 LLM 调用 + JSON 容错 + 429 退避 + stub 后端
+│   │   ├── llm.py          # 统一 LLM 调用 + JSON 容错 + 429/5xx/连接超时退避重试 + stub 后端
+│   │   └── robust.py       # 长任务健壮性（方向 G'）：节点级错误隔离 node_guard
 │   ├── ingest/
 │   │   ├── base.py         # Paper 结构、限流器、礼貌 HTTP
 │   │   ├── arxiv_client.py
@@ -463,7 +481,7 @@ lit-review-agent/
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 132 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘）
+├── tests/                  # 139 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -474,11 +492,11 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 132 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘）
+pytest -m "not network"     # 139 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**、**Web UI 接 HITL 反馈（`/review/stream` 挂起回传草稿、 `/review/resume` 回填意见续跑、多轮改稿定稿闭环）**、**引用网络可视化（Web UI 交互式力导向网络图、节点着色/大小语义、点击高亮邻居、研究空白高亮）**、**质量评估仪表盘（`compute_quality_report` 六维度得分、加权总分与等级、薄弱项改进建议与亮点、`done` 事件回传、Web UI 面板渲染）**。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**、**Web UI 接 HITL 反馈（`/review/stream` 挂起回传草稿、 `/review/resume` 回填意见续跑、多轮改稿定稿闭环）**、**引用网络可视化（Web UI 交互式力导向网络图、节点着色/大小语义、点击高亮邻居、研究空白高亮）**、**质量评估仪表盘（`compute_quality_report` 六维度得分、加权总分与等级、薄弱项改进建议与亮点、`done` 事件回传、Web UI 面板渲染）**、**长任务健壮性（节点级错误隔离 `node_guard`、LLM 瞬时错误重试分类、`run_errors` 跨节点累积、超时看门狗最佳努力成稿、`done` 事件回传 `errors`/`timed_out`、Web UI 运行告警面板、CLI 超时提示）**。
 
 ---
 
@@ -503,7 +521,7 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
 - 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若改用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
-> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿；**引用网络可视化（方向 E'）**——Web UI 内嵌交互式力导向网络图，点击枢纽论文看引用/被引、研究空白高亮；**质量评估仪表盘（方向 F'）**——把 faithfulness + 引用网络 + claim 锚定等信号聚合成六维度质量报告，Web UI 一键看总分与改进建议。详见 `CHANGELOG.md`。
+> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿；**引用网络可视化（方向 E'）**——Web UI 内嵌交互式力导向网络图，点击枢纽论文看引用/被引、研究空白高亮；**质量评估仪表盘（方向 F'）**——把 faithfulness + 引用网络 + claim 锚定等信号聚合成六维度质量报告，Web UI 一键看总分与改进建议；**长任务健壮性（方向 G'）**——节点级错误隔离 + LLM 瞬时错误退避重试 + 超时看门狗最佳努力成稿，所有降级/超时在成稿附录 A.9、Web UI 运行告警面板、API 响应与 CLI 汇总里显式呈现。详见 `CHANGELOG.md`。
 
 ## 路线
 
@@ -528,4 +546,5 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] **方向 A'：Web UI 接 HITL 反馈**（浏览器看草稿、提意见、多轮改稿后定稿；`/review/stream` 带 `with_human` 推送 `interrupted` 含草稿全文，`/review/resume` 回填意见续跑，强制 SQLite 检查点）
 - [x] **方向 E'：引用网络可视化**（Web UI 内嵌交互式力导向网络图：节点按簇着色/按枢纽度定大小，点击高亮邻居与引用-被引列表，研究空白高亮；`citation_graph.json` 侧车；纯原生 JS 无 CDN 依赖）
 - [x] **方向 F'：质量评估仪表盘**（聚合 faithfulness + 引用网络枢纽度 + claim 锚定等信号成六维度质量报告，Web UI 渲染总分环/评分条/改进建议，`quality_report.json` 侧车，纯函数零依赖）
+- [x] **方向 G'：长任务健壮性**（节点级错误隔离 `node_guard` + LLM 瞬时错误 429/5xx/连接超时退避重试 + 超时看门狗最佳努力成稿；`run_errors`/`timed_out` 在成稿附录 A.9、Web UI 运行告警面板、API 响应与 CLI 汇总里显式呈现）
 - [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
