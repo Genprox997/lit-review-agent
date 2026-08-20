@@ -38,6 +38,7 @@ class Paper(TypedDict, total=False):
     relevance: float       # 与主题的相关性（P0-1 闸门）
     has_fulltext: bool     # 是否成功获取 OA 全文（P0-2）
     fulltext_chars: int    # 全文字符数
+    fulltext_struct: Optional[Dict[str, Any]]  # PDF 深度解析结构化结果（方向 J'）
     openalex_id: str       # OpenAlex 作品 ID（用于构建引用图，方向 D'）
     referenced_works: List[str]  # 引用作品的 OpenAlex ID 列表（方向 D' 引用网络分析）
 
@@ -264,6 +265,7 @@ def make_paper(**kwargs) -> Paper:
         "relevance": 0.0,
         "has_fulltext": False,
         "fulltext_chars": 0,
+        "fulltext_struct": kwargs.get("fulltext_struct"),
         "openalex_id": kwargs.get("openalex_id", ""),
         "referenced_works": kwargs.get("referenced_works") or [],
     }

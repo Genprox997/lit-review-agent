@@ -123,6 +123,14 @@ class Settings:
     cache_dir: Path = field(default_factory=lambda: PROJECT_ROOT / _env("CACHE_DIR", ".cache"))
     report_language: str = field(default_factory=lambda: _env("REPORT_LANGUAGE", "zh").lower())
     enable_fulltext: bool = field(default_factory=lambda: _env_bool("ENABLE_FULLTEXT", True))
+    # ---- PDF 深度解析（方向 J'）----
+    enable_pdf_deep_parse: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_PDF_DEEP_PARSE", True)
+    )
+    pdf_deep_parser: str = field(
+        default_factory=lambda: _env("PDF_DEEP_PARSER", "auto").lower()
+    )
+    pdf_max_pages: int = field(default_factory=lambda: _env_int("PDF_MAX_PAGES", 30))
     output_format: str = field(
         default_factory=lambda: _env("OUTPUT_FORMAT", "md").lower()
     )

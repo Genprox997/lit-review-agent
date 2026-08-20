@@ -144,6 +144,8 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 
 不必全下 PDF：综述覆盖数十上百篇，真正需读全文的只是高相关那批（`TOP_N_FULLTEXT`，默认 8 篇），其余用摘要。全文会做 **头尾保留式压缩**（开头的摘要+引言+方法、结尾的实验结论），丢弃中间的公式推导，显著省 token。
 
+**PDF 深度解析（方向 J'）**：下载到 OA PDF 后，除纯文本外还会做**版面感知结构化解析**——切分章节（编号/关键词标题，中英文皆可）、抽取摘要与关键词、识别量表（Table/Figure 图注及其表体行）；Extractor 据此从「摘要 + 方法/结果相关章节」精准抽取证据，而非盲目取首尾。解析结果存于 `paper["fulltext_struct"]`，成稿时落盘为 `<stem>_fulltext_struct.json` 聚合侧车（每篇章节数/图注/表数/是否含摘要）。全程离线默认可用（纯启发式），装了 `unstructured` 并通过 `PDF_DEEP_PARSER=unstructured` 开启时可走更准的版面解析。
+
 全文抓取做了两处工程处理（P0-2）：
 
 - **优先选 OA 可用文献**：从排序后的候选里优先挑「有 OA PDF 直链 / 可用 DOI 经 Unpaywall 解析」的论文下载，避免旧逻辑按总分取 Top-N 时总选中付费墙期刊论文（无 OA 副本），导致「全文解析 0 篇」；
@@ -221,6 +223,9 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 | `HTTP_CACHE_ENABLED` | `true` | 检索 GET 响应磁盘缓存开关（P3-4）：命中则跳过网络，省学术 API 配额 |
 | `HTTP_CACHE_TTL_DAYS` | `7` | 缓存有效期（天）；过期自动回源重取 |
 | `RUN_TIMEOUT_SECONDS` | `1800` | 长任务超时上限（秒）：超过则中断流式循环并产出「最佳努力成稿」；`0` 关闭看门狗 |
+| `ENABLE_PDF_DEEP_PARSE` | `true` | PDF 深度解析开关（方向 J'）：开启后把 OA PDF 解析为章节/摘要/量表结构化结果 `fulltext_struct` |
+| `PDF_DEEP_PARSER` | `auto` | 深度解析后端：`auto`/`heuristic` 用纯启发式（离线默认可用）；`unstructured` 优先用 `unstructured` 版面解析（需额外安装，否则回退启发式） |
+| `PDF_MAX_PAGES` | `30` | 单篇 PDF 深度解析的最大页数（方向 J'），超出只取前 N 页 |
 | `CITATION_HUB_WEIGHT` | `0.10` | 引用网络枢纽度（PageRank）在综合排序中的权重（方向 D'）；无引用数据时恒为 0 |
 | `INCREMENTAL_DEFAULT_DAYS` | `180` | 增量更新未给 `--since` 时的默认回看窗口（天），仅增量模式生效（方向 B'） |
 
@@ -439,6 +444,19 @@ open http://localhost:8000/
 
 > 适用场景：`TARGET_PAPER_COUNT` 调很大、或主题很偏导致某源频繁报错/超时（如 PubMed 偶发 5xx、OpenAlex 限流）时，图不再颗粒无收，而是降级产出最佳努力成稿并把每处失败摆在台面上。
 
+### PDF 深度解析（方向 J'）
+
+把「下载 PDF → `pypdf` 抽纯文本」升级为**版面感知的结构化解析**，让全文证据的抽取更准、更省 token：
+
+- **章节切分**：识别两类标题——「编号标题」（`1` / `1.2` / `3.1.4`，中英文标题皆可）与「关键词标题」（`Abstract`/`Introduction`/`Method`/`Results`/`Conclusion` 及其常见中文对应如 `摘要`/`方法`/`结论`），输出带层级的 `sections`；无标题时退化为单节 `Full Text`。
+- **摘要 / 关键词抽取**：命中 `Abstract`/`摘要` 小节抽取摘要；抓取 `Keywords:` / `关键词` 行。
+- **量表识别**：通过 `Table N` / `Figure N` 图注正则，并在**保留列对齐的原始行**上识别表体行（避免空白压缩破坏对齐），输出 `tables:[{caption, rows}]` 与 `figures:[{caption}]`。
+- **Extractor 精准消费**：`extractor_body_from_struct` 挑「摘要 + 方法/结果/实验/讨论/结论」相关章节拼装带 `## 标题` 标签的萃取正文，并附「图表线索」，**截断到预算**；Extractor 据此从正确位置抽取方法/结论，而非盲目取首尾。无结构化结果时自动退回既有 head/tail 行为（摘要模式兼容）。
+- **可选 unstructured 加速**：装了 `unstructured` 并通过 `PDF_DEEP_PARSER=unstructured` 开启时，优先用其版面元素做解析；未安装或缺省时回退纯启发式，**离线绿灯、零重依赖**。
+- **落盘**：结构化解析存于 `paper["fulltext_struct"]`，成稿时落盘 `<stem>_fulltext_struct.json` 聚合侧车（每篇章节数、章节标题、表数、图数、是否含摘要、关键词），供人工复核版面抽取质量；`*_papers.json` 不塞原始结构化结果（避免库体膨胀）。
+
+相关配置：`ENABLE_PDF_DEEP_PARSE`（默认开）、`PDF_DEEP_PARSER`（`auto`/`heuristic`/`unstructured`）、`PDF_MAX_PAGES`（默认 30）。
+
 ---
 
 ## 可观测（LangSmith）
@@ -475,13 +493,13 @@ lit-review-agent/
 │   │   ├── crossref.py     # DOI 元数据 + 被引数（出版社页靠 Unpaywall 兜底）
 │   │   ├── unpaywall.py    # 按 DOI 兜底找 OA
 │   │   ├── downloader.py   # OA 解析 + PDF 下载 + license sidecar
-│   │   └── pdf_parser.py   # pypdf 抽取 + 头尾压缩
+│   │   └── pdf_parser.py   # pypdf 抽取 + 头尾压缩 + 深度结构化解析（方向 J'）
 │   ├── cluster/theme_cluster.py
 │   ├── report/bibtex.py
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 139 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性）
+├── tests/                  # 156 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -492,11 +510,11 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 139 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性）
+pytest -m "not network"     # 156 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
-离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**、**Web UI 接 HITL 反馈（`/review/stream` 挂起回传草稿、 `/review/resume` 回填意见续跑、多轮改稿定稿闭环）**、**引用网络可视化（Web UI 交互式力导向网络图、节点着色/大小语义、点击高亮邻居、研究空白高亮）**、**质量评估仪表盘（`compute_quality_report` 六维度得分、加权总分与等级、薄弱项改进建议与亮点、`done` 事件回传、Web UI 面板渲染）**、**长任务健壮性（节点级错误隔离 `node_guard`、LLM 瞬时错误重试分类、`run_errors` 跨节点累积、超时看门狗最佳努力成稿、`done` 事件回传 `errors`/`timed_out`、Web UI 运行告警面板、CLI 超时提示）**。
+离线测试用 stub LLM + 假检索覆盖了：标识符规范化、跨源去重合并、排序信号、相关性闸门与自适应保底、OpenAlex 摘要还原与 filter 转义、PDF 文本处理、全文 OA 优先获取、限流、**PubMed / Crossref 解析与接线**、聚类可分性与编号（含 embedding 分支）、BibTeX 条目类型与转义（含 arXiv 预印本+期刊 DOI 的 venue 纠错）、JSON 容错解析、引用防幻觉、两个环路的路由边界、端到端成稿结构与引用完整性、**Human-in-the-loop 挂起与 `Command(resume)` 续跑及针对性重写回环**、**引用编号跨轮次稳定**、**faithfulness 引用-论断一致性校验（含关闭分支）**、**LaTeX / docx 多格式成稿输出**、**LLM 429 退避重试**、**引用网络分析（PageRank 枢纽度 / betweenness 桥接度、共引空白、附录 A.8）**、**增量更新综述（载入历史池、沿用编号、保留未变小节、无 base 安全降级）**、**Web UI 接 HITL 反馈（`/review/stream` 挂起回传草稿、 `/review/resume` 回填意见续跑、多轮改稿定稿闭环）**、**引用网络可视化（Web UI 交互式力导向网络图、节点着色/大小语义、点击高亮邻居、研究空白高亮）**、**质量评估仪表盘（`compute_quality_report` 六维度得分、加权总分与等级、薄弱项改进建议与亮点、`done` 事件回传、Web UI 面板渲染）**、**长任务健壮性（节点级错误隔离 `node_guard`、LLM 瞬时错误重试分类、`run_errors` 跨节点累积、超时看门狗最佳努力成稿、`done` 事件回传 `errors`/`timed_out`、Web UI 运行告警面板、CLI 超时提示）**、**PDF 深度解析（`deep_parse_text` 章节切分/摘要/关键词/量表识别、`extractor_body_from_struct` 章节化萃取正文、`fulltext_struct` 聚合侧车、可选 unstructured 加速）**。
 
 ---
 
@@ -546,5 +564,6 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] **方向 A'：Web UI 接 HITL 反馈**（浏览器看草稿、提意见、多轮改稿后定稿；`/review/stream` 带 `with_human` 推送 `interrupted` 含草稿全文，`/review/resume` 回填意见续跑，强制 SQLite 检查点）
 - [x] **方向 E'：引用网络可视化**（Web UI 内嵌交互式力导向网络图：节点按簇着色/按枢纽度定大小，点击高亮邻居与引用-被引列表，研究空白高亮；`citation_graph.json` 侧车；纯原生 JS 无 CDN 依赖）
 - [x] **方向 F'：质量评估仪表盘**（聚合 faithfulness + 引用网络枢纽度 + claim 锚定等信号成六维度质量报告，Web UI 渲染总分环/评分条/改进建议，`quality_report.json` 侧车，纯函数零依赖）
-- [x] **方向 G'：长任务健壮性**（节点级错误隔离 `node_guard` + LLM 瞬时错误 429/5xx/连接超时退避重试 + 超时看门狗最佳努力成稿；`run_errors`/`timed_out` 在成稿附录 A.9、Web UI 运行告警面板、API 响应与 CLI 汇总里显式呈现）
-- [ ] `unstructured` 解析器（当前 pypdf 已满足 PDF 抽取，单列）
+- [x] **方向 G'：长任务健壮性**（节点级错误隔离 `node_guard`、LLM 瞬时错误退避重试、超时看门狗最佳努力成稿、运行告警全链路呈现 `run_errors`/`timed_out`）
+- [x] **方向 J'：PDF 深度解析**（版面感知结构化抽取：章节切分 / 摘要+关键词 / 量表识别；Extractor 章节化精准萃取；`fulltext_struct` 聚合侧车；可选 `unstructured` 加速）
+- [ ] `unstructured` 解析器（方向 J' 已用纯启发式实现深度解析，`unstructured` 仅作为可选加速后端：`PDF_DEEP_PARSER=unstructured` 开启，未装则自动回退启发式）

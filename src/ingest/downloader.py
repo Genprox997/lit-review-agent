@@ -17,7 +17,7 @@ from typing import List, Optional
 
 from src.config import get_settings
 from src.ingest.base import LIMITERS, Paper, get_session
-from src.ingest.pdf_parser import condense_fulltext, parse_pdf
+from src.ingest.pdf_parser import condense_fulltext, deep_parse_pdf, parse_pdf
 from src.ingest.unpaywall import find_oa_pdf
 
 logger = logging.getLogger(__name__)
@@ -131,6 +131,13 @@ def fetch_fulltexts(papers: List[Paper], max_workers: int = 3) -> int:
         paper["fulltext"] = condense_fulltext(text)
         paper["has_fulltext"] = True
         paper["fulltext_chars"] = len(paper["fulltext"])
+        if settings.enable_pdf_deep_parse:
+            try:
+                struct = deep_parse_pdf(path, max_pages=settings.pdf_max_pages)
+                if struct:
+                    paper["fulltext_struct"] = struct
+            except Exception as exc:  # noqa: BLE001 - 深度解析失败不应影响主流程
+                logger.debug("PDF 深度解析失败 %s: %s", paper["paper_id"], exc)
         return True
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:

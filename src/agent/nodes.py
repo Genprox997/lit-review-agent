@@ -38,6 +38,7 @@ from src.cluster.theme_cluster import cluster_papers
 from src.config import get_settings
 from src.ingest.base import make_paper
 from src.ingest.openalex import enrich_citations
+from src.ingest.pdf_parser import extractor_body_from_struct
 from src.report.bibtex import build_bibtex, build_reference_list
 
 logger = logging.getLogger(__name__)
@@ -320,6 +321,19 @@ def ranker(state: AgentState) -> dict:
 # 4. Extractor
 # ==========================================================================
 def _paper_block(paper: dict, idx: int) -> str:
+    # 优先用 PDF 深度解析的结构化正文（摘要 + 方法/结果相关章节，方向 J'），
+    # 让 Extractor 从正确位置抽取方法/结论，而非盲目取首尾。
+    struct = paper.get("fulltext_struct")
+    if struct:
+        body = extractor_body_from_struct(struct, budget=5000)
+        if body:
+            return (
+                f"### 论文 {idx}\n"
+                f"paper_id: {paper['paper_id']}\n"
+                f"标题: {paper.get('title')}\n"
+                f"年份: {paper.get('year')} | 被引: {paper.get('citation_count', 0)}\n"
+                f"结构化全文（章节化，来自 PDF 深度解析）: {body}\n"
+            )
     body = paper.get("fulltext") or paper.get("abstract") or ""
     body = body[:5000] if paper.get("fulltext") else body[:1800]
     mode = "全文节选" if paper.get("fulltext") else "摘要"
@@ -925,7 +939,7 @@ def synthesizer(state: AgentState) -> dict:
         json.dumps(
             [
                 {
-                    **{k: v for k, v in p.items() if k != "fulltext"},
+                    **{k: v for k, v in p.items() if k not in ("fulltext", "fulltext_struct")},
                     "has_fulltext": bool(p.get("has_fulltext")),
                     "fulltext_chars": int(p.get("fulltext_chars") or 0),
                     "citation_index": citation_map.get(p["paper_id"]),
@@ -981,6 +995,29 @@ def synthesizer(state: AgentState) -> dict:
         encoding="utf-8",
     )
     paths["quality_report"] = str(quality_path)
+
+    # --- PDF 深度解析聚合（方向 J'）：每篇结构化解析摘要，供人工复核版面抽取质量 ---
+    struct_summary: Dict[str, Any] = {}
+    for p in papers:
+        st = p.get("fulltext_struct")
+        if not st:
+            continue
+        struct_summary[p["paper_id"]] = {
+            "n_sections": len(st.get("sections") or []),
+            "section_headings": [s.get("heading", "") for s in (st.get("sections") or [])],
+            "n_tables": len(st.get("tables") or []),
+            "n_figures": len(st.get("figures") or []),
+            "has_abstract": bool((st.get("abstract") or "").strip()),
+            "keywords": st.get("keywords") or [],
+            "parse_method": st.get("parse_method", ""),
+        }
+    if struct_summary:
+        struct_path = out / f"{slug}_{stamp}_fulltext_struct.json"
+        struct_path.write_text(
+            json.dumps(struct_summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        paths["fulltext_struct"] = str(struct_path)
 
     # --- 多格式输出（方向 C）：在 Markdown 之外按需再产出 LaTeX / docx ---
     fmt = settings.output_format

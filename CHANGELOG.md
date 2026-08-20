@@ -4,6 +4,33 @@
 
 ---
 
+## 方向 J'：PDF 深度解析（版面感知结构化抽取）（2026-08-21）
+
+**目标**：把「下载 PDF → `pypdf` 抽纯文本」升级为**布局感知的结构化解析**——在纯文本之上切分章节、抽取摘要/关键词、识别量表（Table/Figure 图注与表体），并让 Extractor 直接从「摘要 + 方法/结果相关章节」而非盲目取首尾来抽取证据，提升全文证据的信号质量。全程离线默认可用（纯启发式），可选 `unstructured` 加速。
+
+**变更内容**
+- **深度解析器**（`src/ingest/pdf_parser.py` 重构 + 新增）：
+  - `deep_parse_text(text, n_pages)`：纯文本布局感知解析，输出 JSON 友好字典 `{title, abstract, keywords, sections:[{heading,level,text}], tables:[{caption,rows}], figures:[{caption}], n_pages, parse_method}`。`sections` 支持「编号标题（含中文）」与「关键词标题（Abstract/Method/Results/结论…）」两类识别；`abstract` 命中摘要小节抽取；`keywords` 抓 `Keywords:/关键词` 行；`tables`/`figures` 通过图注正则 + **保留列对齐的原始行**识别表体（避免空白压缩破坏对齐）。无标题时退化为单节 `Full Text`。
+  - `deep_parse_pdf(path, max_pages)`：抽取文本后串流到 `deep_parse_text`；`PDF_DEEP_PARSER=unstructured` 且已装 `unstructured` 时优先走其版面元素（懒加载，离线默认启发式）。
+  - `extractor_body_from_struct(struct, budget)`：挑「摘要 + 方法/结果/实验/讨论/结论」相关章节拼装带 `## 标题` 标签的萃取正文，并附「图表线索」，截断到预算；供 Extractor 精准抽取。
+  - 保留旧 `parse_pdf` / `clean_pdf_text` / `condense_fulltext` 兼容。
+- **下载层接线**（`src/ingest/downloader.py`）：`fetch_fulltexts` 在解析后，`enable_pdf_deep_parse` 开启时把结构化结果写 `paper["fulltext_struct"]`（异常不影响主流程）。
+- **萃取消费结构化正文**（`src/agent/nodes.py` 的 `_paper_block`）：优先用 `extractor_body_from_struct` 的章节化正文喂 Extractor；无结构化时退回现有 head/tail 行为（兼容摘要模式）。
+- **状态/配置**（`src/ingest/base.py` 的 `Paper` + `src/config.py`）：`Paper` 增可选 `fulltext_struct`；新增 `enable_pdf_deep_parse`（默认 True）、`pdf_deep_parser`（`auto`/`heuristic`/`unstructured`）、`pdf_max_pages`（默认 30）。
+- **成稿落盘与序列化**（`src/agent/nodes.py` 的 `synthesizer`）：新增聚合侧车 `<stem>_fulltext_struct.json`（每篇 `n_sections`/章节标题/`n_tables`/`n_figures`/`has_abstract`/`keywords` 摘要，供人工复核版面抽取质量）；`papers.json` 序列化排除 `fulltext_struct`（避免库体膨胀）。
+
+**涉及文件**
+- `src/ingest/pdf_parser.py`：新增 `deep_parse_text` / `deep_parse_pdf` / `extractor_body_from_struct`（含启发式 + 可选 unstructured 适配）。
+- `src/ingest/downloader.py`：`fetch_fulltexts` 写 `fulltext_struct`。
+- `src/ingest/base.py`：`Paper` 增 `fulltext_struct`。
+- `src/config.py`：新增 `enable_pdf_deep_parse` / `pdf_deep_parser` / `pdf_max_pages`。
+- `src/agent/nodes.py`：`_paper_block` 消费结构化正文；`synthesizer` 写聚合侧车 + `papers.json` 排除 `fulltext_struct`。
+- `tests/test_pdf_parse.py`：新增 14 个测试（章节切分、中英文标题、摘要、关键词、表/图注与表体、退化、预算截断、`deep_parse_pdf` 优雅失败与串流、旧接口兼容）。
+
+**验证**：`pytest tests/test_pdf_parse.py` 14 passed；完整离线套件 **156 passed / 2 skipped / 2 deselected**（无回归）。
+
+---
+
 ## 方向 G'：长任务健壮性（节点级错误隔离 + 超时看门狗 + 运行告警）（2026-08-20）
 
 **目标**：让综述流水线在「节点偶发失败 / LLM 瞬时故障 / 运行过久」三类长任务常见风险下**不白跑、不崩溃、可追溯**——单点失败降级继续而非中断整条流水线；LLM 瞬时错误（429 / 5xx / 连接重置 / 超时）自动退避重试；运行超过上限则中断并产出「最佳努力成稿」；所有降级/超时都在成稿附录、Web UI 面板、API 响应与 CLI 汇总里**显式呈现**，便于事后复核。
