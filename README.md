@@ -79,6 +79,7 @@ flowchart TD
 
 - **内环** `Retriever ⟲`：文献池未达 `TARGET_PAPER_COUNT` 时，放大每条检索式的返回上限重试，最多 `MAX_RETRIEVAL_ROUNDS` 轮。
 - **外环** `Critic → QueryExpander`：评审判定覆盖不足时，带着**具体缺口**生成新检索式补文献——这是综述最容易漏掉关键流派的地方。最多打回 `MAX_CRITIC_ROUNDS` 次。
+- **首轮伪相关反馈扩词** `AutoExpand`（方向 H'）：首轮 `Ranker` 后，从 Top 相关文献挖词生成补充检索式回流 `Retriever` 再检一轮（只做一次），弥补 LLM 扩词偏弱；`Critic` 打回补检时也复用同一机制。
 
 用 `python -m src.main --print-graph` 可打印实际编译出的状态机拓扑。
 
@@ -223,6 +224,9 @@ score = 0.55 × 相关性(TF-IDF 余弦)
 | `HTTP_CACHE_ENABLED` | `true` | 检索 GET 响应磁盘缓存开关（P3-4）：命中则跳过网络，省学术 API 配额 |
 | `HTTP_CACHE_TTL_DAYS` | `7` | 缓存有效期（天）；过期自动回源重取 |
 | `RUN_TIMEOUT_SECONDS` | `1800` | 长任务超时上限（秒）：超过则中断流式循环并产出「最佳努力成稿」；`0` 关闭看门狗 |
+| `ENABLE_AUTO_EXPAND` | `true` | 检索式自动扩词开关（方向 H'）：首轮排序后做伪相关反馈（PRF）挖词补检索 |
+| `MAX_AUTO_QUERIES` | `5` | 单次 PRF 自动扩词最多生成的补充检索式条数（方向 H'） |
+| `AUTO_EXPAND_TOP_K` | `12` | PRF 挖词时取 Top-K 篇最相关文献作为语料（方向 H'） |
 | `ENABLE_PDF_DEEP_PARSE` | `true` | PDF 深度解析开关（方向 J'）：开启后把 OA PDF 解析为章节/摘要/量表结构化结果 `fulltext_struct` |
 | `PDF_DEEP_PARSER` | `auto` | 深度解析后端：`auto`/`heuristic` 用纯启发式（离线默认可用）；`unstructured` 优先用 `unstructured` 版面解析（需额外安装，否则回退启发式） |
 | `PDF_MAX_PAGES` | `30` | 单篇 PDF 深度解析的最大页数（方向 J'），超出只取前 N 页 |
@@ -444,6 +448,16 @@ open http://localhost:8000/
 
 > 适用场景：`TARGET_PAPER_COUNT` 调很大、或主题很偏导致某源频繁报错/超时（如 PubMed 偶发 5xx、OpenAlex 限流）时，图不再颗粒无收，而是降级产出最佳努力成稿并把每处失败摆在台面上。
 
+### 检索式自动扩词（方向 H'：伪相关反馈 PRF）
+
+LLM 扩词偶尔偏弱或失败，导致关键流派漏检。方向 H' 在 LLM 检索式之外加一道**伪相关反馈（Pseudo-Relevance Feedback）自动扩词**：
+
+- **首轮排序后自动扩词**：`ranker` 之后新增 `auto_expand` 节点，从 Top-K 相关文献的标题+摘要里挖掘高区分度词/词组（如 `deformable mirror`、`holography`），生成补充检索式回流 `Retriever` 再检索一轮，显著提升召回。用 `auto_expanded` 标志保证**只做一次**（即便内环在首次 rank 前就消耗多轮也不漏触发），不会与两个环路形成死循环。
+- **打分可解释**：候选词打分 = 词在 Top 集的频度 × IDF（全池文档频次越低越有区分度）；优先抽**词组（bigram）**再补高区分度单字；过滤英文停用词与过短词；与已有检索式/主题做双向子串去重。
+- **外环补检索也受益**：`Critic` 打回补文献（`need_more`）时，若已有文献池，`query_expander` 复用同一 `auto_expand_queries` 从已有文献挖词并入——不依赖 LLM 给好词。
+- **零额外依赖**：`auto_expand_queries` 是纯函数，**无 LLM、无 sklearn 依赖**，离线可确定性单测；可通过 `ENABLE_AUTO_EXPAND` 关闭、`MAX_AUTO_QUERIES` / `AUTO_EXPAND_TOP_K` 调参。
+- **成稿可审计**：附录 A.1 注明「其中 N 条由伪相关反馈（PRF）自动扩词生成」，检索式透明度不打折扣。
+
 ### PDF 深度解析（方向 J'）
 
 把「下载 PDF → `pypdf` 抽纯文本」升级为**版面感知的结构化解析**，让全文证据的抽取更准、更省 token：
@@ -499,7 +513,7 @@ lit-review-agent/
 │   ├── config.py
 │   ├── main.py             # CLI 入口
 │   └── api.py              # FastAPI 入口（可选依赖 [api]）
-├── tests/                  # 156 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析）
+├── tests/                  # 165 离线测试，默认不联网（含 embedding 路径、HITL 续跑与改写回环、Web UI 接 HITL 反馈、PubMed/Crossref、HTTP 缓存、LLM 并发、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析、检索式自动扩词 PRF）
 ├── pyproject.toml
 └── .env.example
 ```
@@ -510,7 +524,7 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 156 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析）
+pytest -m "not network"     # 165 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析、检索式自动扩词 PRF）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 
@@ -539,7 +553,7 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - **OpenAlex 用占位 `CONTACT_EMAIL`（`you@example.com`）会被 polite pool 限流（HTTP 429）**，检索返回空。务必填真实邮箱；
 - 相关性闸门用 TF-IDF 余弦，阈值 0.10 对常见主题合适；若改用 embedding 相关性可酌情提高到 ~0.25（在 `RELEVANCE_GATE` 调整）。
 
-> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿；**引用网络可视化（方向 E'）**——Web UI 内嵌交互式力导向网络图，点击枢纽论文看引用/被引、研究空白高亮；**质量评估仪表盘（方向 F'）**——把 faithfulness + 引用网络 + claim 锚定等信号聚合成六维度质量报告，Web UI 一键看总分与改进建议；**长任务健壮性（方向 G'）**——节点级错误隔离 + LLM 瞬时错误退避重试 + 超时看门狗最佳努力成稿，所有降级/超时在成稿附录 A.9、Web UI 运行告警面板、API 响应与 CLI 汇总里显式呈现。详见 `CHANGELOG.md`。
+> 已解决：引用编号在 Critic 外环打回重聚类后**保持稳定**（保留历史编号、仅追加新论文，见方向 A）；`Human-in-the-loop` 现已支持**针对性重写回环**（意见 → 只重跑受影响小节 → 重新定稿，见方向 A）；**引用网络分析（方向 D'）**与**增量更新已有综述（方向 B'）**亦已完成；**Web UI 已接 HITL 反馈（方向 A'）**——浏览器里看草稿、提意见、多轮改稿后一键定稿；**引用网络可视化（方向 E'）**——Web UI 内嵌交互式力导向网络图，点击枢纽论文看引用/被引、研究空白高亮；**质量评估仪表盘（方向 F'）**——把 faithfulness + 引用网络 + claim 锚定等信号聚合成六维度质量报告，Web UI 一键看总分与改进建议；**长任务健壮性（方向 G'）**——节点级错误隔离 + LLM 瞬时错误退避重试 + 超时看门狗最佳努力成稿，所有降级/超时在成稿附录 A.9、Web UI 运行告警面板、API 响应与 CLI 汇总里显式呈现；**检索式自动扩词（方向 H'）**——在 LLM 扩词之外加一道伪相关反馈（PRF），首轮排序后从 Top 相关文献挖词生成补充检索式回流再检索，显著提升召回、弥补 LLM 扩词偏弱，纯函数零依赖。详见 `CHANGELOG.md`。
 
 ## 路线
 
@@ -565,5 +579,6 @@ pip install grandalf          # --print-graph 显示 ASCII 图
 - [x] **方向 E'：引用网络可视化**（Web UI 内嵌交互式力导向网络图：节点按簇着色/按枢纽度定大小，点击高亮邻居与引用-被引列表，研究空白高亮；`citation_graph.json` 侧车；纯原生 JS 无 CDN 依赖）
 - [x] **方向 F'：质量评估仪表盘**（聚合 faithfulness + 引用网络枢纽度 + claim 锚定等信号成六维度质量报告，Web UI 渲染总分环/评分条/改进建议，`quality_report.json` 侧车，纯函数零依赖）
 - [x] **方向 G'：长任务健壮性**（节点级错误隔离 `node_guard`、LLM 瞬时错误退避重试、超时看门狗最佳努力成稿、运行告警全链路呈现 `run_errors`/`timed_out`）
+- [x] **方向 H'：检索式自动扩词**（伪相关反馈 PRF：首轮排序后从 Top 相关文献挖词生成补充检索式回流再检索；`auto_expand` 节点只触发一次；外环补检复用同一机制；纯函数零依赖、可关可配）
 - [x] **方向 J'：PDF 深度解析**（版面感知结构化抽取：章节切分 / 摘要+关键词 / 量表识别；Extractor 章节化精准萃取；`fulltext_struct` 聚合侧车；可选 `unstructured` 加速）
 - [ ] `unstructured` 解析器（方向 J' 已用纯启发式实现深度解析，`unstructured` 仅作为可选加速后端：`PDF_DEEP_PARSER=unstructured` 开启，未装则自动回退启发式）

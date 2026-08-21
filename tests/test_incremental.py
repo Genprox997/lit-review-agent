@@ -127,14 +127,14 @@ def test_incremental_run_adds_new_papers_and_notes(stub_env, tmp_path, monkeypat
     stub_env.target_paper_count = 24   # = 旧池规模，避免内环重复检索
     stub_env.max_retrieval_rounds = 1
 
-    # 两轮共用同一假检索：第 1 次返回旧池，第 2 次返回旧池 + 2 篇新论文
-    calls = {"n": 0}
+    # 两轮共用同一假检索：第 1 轮（正常生成）只返回旧池；
+    # 第 2 轮（增量）返回旧池 + 2 篇新论文。
+    # 注意：用「第几轮」而非「调用次数」区分——方向 H' 的伪相关反馈扩词
+    # 会在每轮首排后额外触发一次检索，不能依赖调用次数。
+    run_flag = {"second": False}
 
     def fake_search(queries, settings=None):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _old_pool()
-        return _old_pool() + _new_papers()
+        return _old_pool() + (_new_papers() if run_flag["second"] else [])
 
     monkeypatch.setattr(N, "multi_source_search", fake_search)
     monkeypatch.setattr(N, "enrich_citations", lambda p, limit=25: 0)
@@ -148,6 +148,7 @@ def test_incremental_run_adds_new_papers_and_notes(stub_env, tmp_path, monkeypat
     r1cmap = r1["citation_map"]
 
     # 第二轮：增量模式，检索返回旧池 + 2 篇新论文
+    run_flag["second"] = True
     g2 = build_graph()
     r2 = g2.invoke(
         initial_state("inc topic", incremental=True, since_date="2023-01-01", base_path=base),

@@ -2,14 +2,16 @@
 
 拓扑（对应设计方案 §2）：
 
-    START → QueryExpander → Retriever ⟲(数量不足) → Ranker → Extractor
+    START → QueryExpander → Retriever ⟲(数量不足) → Ranker
+          → AutoExpand(PRF 自动扩词, 方向 H') ⟲(有新增检索式→Retriever) → Extractor
           → Clusterer → SectionWriter → Critic ⟲(覆盖不足→QueryExpander)
           → GapAnalyzer → Synthesizer → Human(可选) → END
 
 双环路：
 - 内环 `Retriever ⟲`：文献池未达目标规模时放大检索量重试；
-- 外环 `Critic → QueryExpander`：评审判定覆盖不足时，带着缺口生成新检索式补文献。
-两个环都有硬性轮次上限，杜绝死循环。
+- 外环 `Critic → QueryExpander`：评审判定覆盖不足时，带着缺口生成新检索式补文献
+  （方向 H' 同时用伪相关反馈从已有文献挖词扩检）；
+- `AutoExpand` 仅在首轮排序后触发一次，避免与两个环形成死循环。
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from src.agent.nodes import (
+    auto_expand,
     clusterer,
     critic,
     extractor,
@@ -83,6 +86,14 @@ def route_after_critic(state: AgentState) -> str:
     return "gap_analyzer"
 
 
+def route_after_auto_expand(state: AgentState) -> str:
+    """方向 H'：伪相关反馈扩词节点产出新检索式 → 回流 Retriever 再检索一轮；
+    否则直接进入抽取阶段。"""
+    if state.get("pending_queries"):
+        return "retriever"
+    return "extractor"
+
+
 def route_after_human(state: AgentState) -> str:
     """人工审核后的路由（方向 A）。
 
@@ -119,6 +130,7 @@ def build_graph(
     builder.add_node("query_expander", node_guard("query_expander", query_expander))
     builder.add_node("retriever", node_guard("retriever", retriever))
     builder.add_node("ranker", node_guard("ranker", ranker))
+    builder.add_node("auto_expand", node_guard("auto_expand", auto_expand))  # 方向 H'
     builder.add_node("extractor", node_guard("extractor", extractor))
     builder.add_node("clusterer", node_guard("clusterer", clusterer))
     builder.add_node("incremental_plan", node_guard("incremental_plan", incremental_plan))  # 方向 B'
@@ -147,7 +159,12 @@ def build_graph(
         {"retriever": "retriever", "ranker": "ranker", "__end__": END},
     )
 
-    builder.add_edge("ranker", "extractor")
+    builder.add_edge("ranker", "auto_expand")  # 方向 H'：首轮排序后伪相关反馈扩词
+    builder.add_conditional_edges(
+        "auto_expand",
+        route_after_auto_expand,
+        {"retriever": "retriever", "extractor": "extractor"},
+    )
     builder.add_edge("extractor", "clusterer")
     builder.add_edge("clusterer", "incremental_plan")
     builder.add_edge("incremental_plan", "section_writer")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Sequence
@@ -296,6 +297,181 @@ def rank_papers(
     logger.info("排序完成，Top3: %s",
                 [(p["title"][:40], p["score"]) for p in papers[:3]])
     return papers
+
+
+# ==========================================================================
+# 检索式自动扩词（方向 H'）：伪相关反馈（PRF）
+# ==========================================================================
+# 学术英文停用词（高频低区分度），扩词时丢弃
+_PRF_STOP = set(
+    """
+a an the of for and or to in on at by with from as is are be been being was were
+this that these those we our their his her its their they them it he she you your
+i me my us using used use uses based via can may also more most less such which who
+whom whose than then thus there here between among within without over under above
+below into onto upon during before after while if else when where why how what all
+any each both either neither not no nor so too very just only own same other another
+paper papers study studies method methods methodology approach approaches result
+results proposed propose present presents presentation show shows shown demonstrate
+demonstrates analysis analyses model models modeling data dataset datasets set sets
+experiment experiments experimental system systems algorithm algorithms framework
+novel new recent research work works using use via using
+""".split()
+)
+
+_PRF_TOKEN_RE = re.compile(r"[a-z][a-z0-9\-]{2,}")
+
+
+def _prf_doc_text(paper: Paper) -> str:
+    """拼装一篇文献的可挖掘文本（标题权重高于摘要）。"""
+    title = (paper.get("title") or "").lower()
+    abstract = (paper.get("abstract") or "").lower()
+    return f"{title} {title} {abstract}"
+
+
+def _prf_tokens(text: str) -> List[str]:
+    return [
+        t for t in _PRF_TOKEN_RE.findall(text)
+        if t not in _PRF_STOP and len(t) >= 3 and not t.isdigit()
+    ]
+
+
+def _prf_bigrams(tokens: List[str]) -> List[str]:
+    return [f"{tokens[i]} {tokens[i + 1]}" for i in range(len(tokens) - 1)]
+
+
+def auto_expand_queries(
+    papers: Sequence[Paper],
+    topic: str = "",
+    existing_queries: Optional[Sequence[str]] = None,
+    settings: Optional[Settings] = None,
+    top_k: Optional[int] = None,
+    max_queries: Optional[int] = None,
+) -> List[str]:
+    """伪相关反馈（PRF）自动扩词：从 Top-K 篇相关文献的标题+摘要中挖掘
+    高区分度检索词与词组，生成补充检索式以扩充召回。
+
+    - 纯函数，无 LLM、无 sklearn 依赖，离线可确定性单测；
+    - 打分 = 词在 Top 集中的频度 × IDF（全池文档频次越低越有区分度）；
+    - 优先抽取词组（bigram，如 "deformable mirror"），其次单字检索词；
+    - 与已有检索式 / 主题做去重，避免重复检索。
+
+    Returns:
+        新生成的检索式列表（已去重、按区分度降序截断到 max_queries）。
+    """
+    settings = settings or get_settings()
+    if not settings.enable_auto_expand or not papers:
+        return []
+
+    top_k = top_k or settings.auto_expand_top_k
+    max_queries = max_queries or settings.max_auto_queries
+    if max_queries <= 0 or top_k <= 0:
+        return []
+
+    existing = {str(q).lower().strip() for q in (existing_queries or [])}
+    existing.add((topic or "").lower().strip())
+
+    # 选 Top-K：优先相关性，其次 score，再次被引
+    ranked = sorted(
+        papers,
+        key=lambda p: (
+            p.get("relevance") or 0,
+            p.get("score") or 0,
+            p.get("citation_count") or 0,
+        ),
+        reverse=True,
+    )
+    top = ranked[:top_k]
+
+    # 全池用于 IDF
+    all_docs = [_prf_doc_text(p) for p in papers]
+    top_docs = [_prf_doc_text(p) for p in top]
+    n_all = max(1, len(all_docs))
+    n_top = max(1, len(top_docs))
+
+    # 词频（全池 / Top 集）
+    tf_all: Dict[str, int] = defaultdict(int)
+    tf_top: Dict[str, int] = defaultdict(int)
+    df_all: Dict[str, int] = defaultdict(int)
+    df_top: Dict[str, int] = defaultdict(int)
+    for d in all_docs:
+        toks = set(_prf_tokens(d))
+        for t in toks:
+            tf_all[t] += 1
+            df_all[t] += 1
+    for d in top_docs:
+        toks = set(_prf_tokens(d))
+        for t in toks:
+            tf_top[t] += 1
+            df_top[t] += 1
+
+    # 词组频（Top 集内）
+    bg_top: Dict[str, int] = defaultdict(int)
+    bg_df_top: Dict[str, int] = defaultdict(int)
+    for d in top_docs:
+        toks = _prf_tokens(d)
+        for bg in _prf_bigrams(toks):
+            bg_top[bg] += 1
+        for bg in set(_prf_bigrams(toks)):
+            bg_df_top[bg] += 1
+
+    def _idf(term: str) -> float:
+        df = df_all.get(term, 0) + 1
+        return math.log((n_all + 1) / df) + 1.0
+
+    # 候选词组：在至少 2 篇 Top 文献出现，按 频度×IDF 排序
+    scored_bg: List[tuple] = []
+    for bg, c in bg_top.items():
+        if bg_df_top.get(bg, 0) < 2:
+            continue
+        if any(w in _PRF_STOP for w in bg.split()):
+            continue
+        scored_bg.append((bg, c * _idf(bg.split()[0]) * _idf(bg.split()[1])))
+    scored_bg.sort(key=lambda x: x[1], reverse=True)
+
+    # 候选单词：在 Top 集出现，按 频度×IDF 排序
+    scored_uni: List[tuple] = []
+    for t, c in tf_top.items():
+        if df_top.get(t, 0) < 1:
+            continue
+        scored_uni.append((t, c * _idf(t)))
+    scored_uni.sort(key=lambda x: x[1], reverse=True)
+
+    # 组装检索式：优先词组，再补未覆盖的高区分度单词
+    chosen: List[str] = []
+    covered_stems: set = set()
+
+    def _redundant(q: str) -> bool:
+        ql = q.strip().lower()
+        if not ql or ql in existing:
+            return True
+        for ex in existing:
+            if ql in ex or ex in ql:
+                return True
+        for ch in chosen:
+            if ql in ch or ch in ql:
+                return True
+        return False
+
+    for bg, _ in scored_bg:
+        if len(chosen) >= max_queries:
+            break
+        if _redundant(bg):
+            continue
+        chosen.append(bg)
+        for w in bg.split():
+            covered_stems.add(w)
+
+    for t, _ in scored_uni:
+        if len(chosen) >= max_queries:
+            break
+        if t in covered_stems:
+            continue
+        if _redundant(t):
+            continue
+        chosen.append(t)
+
+    return chosen
 
 
 def year_histogram(papers: Sequence[Paper]) -> Dict[int, int]:

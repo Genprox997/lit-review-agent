@@ -23,6 +23,7 @@ from src.agent import citation_graph as CG  # 引用网络分析（方向 D'）
 from src.agent import quality as QL          # 质量评估仪表盘（方向 F'）
 from src.agent.tools import (
     apply_relevance_gate,
+    auto_expand_queries,
     compute_relevance,
     dedup_papers,
     enrich_topn_fulltext,
@@ -156,9 +157,23 @@ def query_expander(state: AgentState) -> dict:
     if not pending and not old_queries:  # LLM 失败兜底
         pending = [topic, f"{topic} survey", f"{topic} review"]
 
+    # 方向 H'：伪相关反馈自动扩词。已有文献池时（评审打回补检索 / 增量续跑），
+    # 从 Top 相关文献挖掘高区分度词补充检索式，提升召回——即使 LLM 没给出好词。
+    auto_q: List[str] = []
+    if is_refine and state.get("papers"):
+        auto_q = auto_expand_queries(
+            state["papers"], topic, existing_queries=list(seen), settings=get_settings(),
+        )
+        for q in auto_q:
+            ql = q.lower()
+            if ql not in seen:
+                seen.add(ql)
+                pending.append(q)
+
     return {
         "queries": old_queries + pending,
         "pending_queries": pending,
+        "auto_expanded_queries": list(state.get("auto_expanded_queries") or []) + auto_q,
         "logs": [_log(f"QueryExpander: {'补充' if is_refine else '生成'} {len(pending)} 条检索式 → {pending}")],
     }
 
@@ -239,6 +254,44 @@ def retriever(state: AgentState) -> dict:
                 + f"，合并去重后文献池 {len(merged)} 篇"
             )
         ],
+    }
+
+
+# ==========================================================================
+# 2.5 自动扩词（方向 H'）：伪相关反馈（PRF）
+# ==========================================================================
+def auto_expand(state: AgentState) -> dict:
+    """首轮排序后做一次伪相关反馈扩词：从 Top 相关文献挖掘高区分度词/词组，
+    生成补充检索式回流到 Retriever 再检索一轮以扩充召回。
+
+    用 `auto_expanded` 标志保证只做一次——无论第一次检索是否已凑足目标数量
+    （内环可能在首次 rank 前就消耗多轮 retrieval），都不会因轮次判断而漏触发，
+    也不会与 Retriever 内环 / Critic 外环形成死循环；后续补检索的扩词由
+    `query_expander`（评审打回分支）复用同一 `auto_expand_queries` 完成。
+    """
+    settings = get_settings()
+    if not settings.enable_auto_expand:
+        return {}
+    if state.get("auto_expanded"):
+        return {}
+    papers = state.get("papers") or []
+    if not papers:
+        return {}
+    existing = set(state.get("queries") or []) | set(state.get("auto_expanded_queries") or [])
+    new_q = auto_expand_queries(
+        papers, state.get("topic", ""), existing_queries=existing, settings=settings,
+    )
+    if not new_q:
+        return {
+            "auto_expanded": True,
+            "logs": [_log("AutoExpand(伪相关反馈): 无高区分度词可挖，跳过")],
+        }
+    return {
+        "pending_queries": new_q,
+        "queries": list(state.get("queries") or []) + new_q,
+        "auto_expanded_queries": list(state.get("auto_expanded_queries") or []) + new_q,
+        "auto_expanded": True,
+        "logs": [_log(f"AutoExpand(伪相关反馈): 从 Top 文献挖掘 {len(new_q)} 条新检索式 → {new_q}")],
     }
 
 
@@ -1130,6 +1183,12 @@ def _assemble_markdown(
         f"## 附录 A：生成过程\n",
         "### A.1 检索式\n",
         "\n".join(f"{i}. `{q}`" for i, q in enumerate(state.get("queries") or [], 1)) or "（无）",
+        (
+            f"\n\n> 其中 **{len(state.get('auto_expanded_queries') or [])}** 条由"
+            "伪相关反馈（PRF，方向 H'）从 Top 相关文献自动扩词生成。"
+            if state.get("auto_expanded_queries")
+            else ""
+        ),
         "\n### A.2 主题簇\n",
         "\n".join(
             f"- **{c['label']}**（{c['size']} 篇）关键词：{', '.join(c.get('keywords') or []) or '—'}"

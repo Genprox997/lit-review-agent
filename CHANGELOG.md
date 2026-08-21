@@ -4,6 +4,28 @@
 
 ---
 
+## 方向 H'：检索式自动扩词（伪相关反馈 PRF）（2026-08-21）
+
+**目标**：在 LLM 生成检索式之外，新增**伪相关反馈（Pseudo-Relevance Feedback）自动扩词**——从首轮 Top 相关文献的标题+摘要中挖掘高区分度词/词组（如 `deformable mirror`、`holography`），自动生成补充检索式并回流检索，显著提升召回、弥补 LLM 扩词偏弱或失败的缺口。纯函数实现，**无 LLM、无 sklearn 依赖**，离线可确定性单测。
+
+**变更内容**
+- **核心纯函数**（`src/agent/tools.py` 新增 `auto_expand_queries`）：
+  - 选 Top-K 文献（优先相关性→score→被引），在全池上做 IDF、在 Top 集上做词频，打分 = 词频 × IDF；
+  - 优先抽取**词组（bigram）**如 `deformable mirror`，其次高区分度单字检索词；过滤英文停用词与过短词；
+  - 与已有检索式 / 主题做双向子串去重，避免重复检索；按 `max_auto_queries` 截断。
+- **新节点 `auto_expand`**（`src/agent/nodes.py`）：首轮排序后触发一次 PRF 扩词，产出新检索式则回流 `Retriever` 再检索一轮；用 `auto_expanded` 标志保证**只做一次**（无论内环是否在首次 rank 前消耗多轮），杜绝死循环。
+- **外环补检索也受益**（`query_expander`）：评审打回（`need_more`）补文献时，若已有文献池，复用同一 `auto_expand_queries` 从已有文献挖词并入，不依赖 LLM 给好词。
+- **配置项**（`src/config.py`）：`ENABLE_AUTO_EXPAND`（默认 `True`）/ `MAX_AUTO_QUERIES`（默认 `5`）/ `AUTO_EXPAND_TOP_K`（默认 `12`）。
+- **状态字段**（`src/agent/state.py`）：`auto_expanded_queries`（PRF 生成的检索式）、`auto_expanded`（防重复标志）；`initial_state` 补种子。
+- **图拓扑**（`src/agent/graph.py`）：`ranker → auto_expand →（有新增检索式→retriever | 否则→extractor）`；更新路由 `route_after_auto_expand` 与拓扑说明。
+- **成稿可审计**（`src/agent/nodes.py` 附录 A.1）：标注「其中 N 条由伪相关反馈（PRF）自动扩词生成」。
+- **测试**（`tests/test_auto_expand.py` 新增 9 个）：挖词/去重（已有检索式、主题覆盖、禁用、截断上限）、节点 round 触发与 `auto_expanded` 拦截、外环 `query_expander` 并入 PRF。
+- **联动修复**：增量测试 `tests/test_incremental.py` 的 `fake_search` 由「调用次数」改为「第几轮」驱动——方向 H' 在每轮首排后额外触发一次检索，原调用次数假设失效。
+
+**验证**：离线套件 165 passed / 2 skipped / 2 deselected（`pytest -m "not network"`）。
+
+---
+
 ## 方向 J'：PDF 深度解析（版面感知结构化抽取）（2026-08-21）
 
 **目标**：把「下载 PDF → `pypdf` 抽纯文本」升级为**布局感知的结构化解析**——在纯文本之上切分章节、抽取摘要/关键词、识别量表（Table/Figure 图注与表体），并让 Extractor 直接从「摘要 + 方法/结果相关章节」而非盲目取首尾来抽取证据，提升全文证据的信号质量。全程离线默认可用（纯启发式），可选 `unstructured` 加速。

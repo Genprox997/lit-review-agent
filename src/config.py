@@ -87,6 +87,17 @@ class Settings:
     n_clusters: int = field(default_factory=lambda: _env_int("N_CLUSTERS", 0))
     min_year: int = field(default_factory=lambda: _env_int("MIN_YEAR", 0))
 
+    # ---- 检索式自动扩词（方向 H'）：伪相关反馈（PRF）----
+    enable_auto_expand: bool = field(
+        default_factory=lambda: _env_bool("ENABLE_AUTO_EXPAND", True)
+    )
+    max_auto_queries: int = field(
+        default_factory=lambda: _env_int("MAX_AUTO_QUERIES", 5)
+    )
+    auto_expand_top_k: int = field(
+        default_factory=lambda: _env_int("AUTO_EXPAND_TOP_K", 12)
+    )
+
     # ---- Human-in-the-loop 闭环改写上限（方向 A）----
     max_human_rounds: int = field(default_factory=lambda: _env_int("MAX_HUMAN_ROUNDS", 2))
 

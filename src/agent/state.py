@@ -69,6 +69,8 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     queries: List[str]                          # 累计的全部检索式
     pending_queries: List[str]                  # 本轮待执行的检索式（Retriever 消费）
+    auto_expanded_queries: List[str]            # 方向 H'：由伪相关反馈（PRF）自动扩词生成的检索式
+    auto_expanded: bool                         # 方向 H'：是否已做过一次 PRF 扩词（防重复/死循环）
     papers: List[Paper]                         # 去重排序后的文献池
     evidence: Annotated[List[Evidence], operator.add]
     clusters: List[Dict[str, Any]]              # [{cluster_id,label,keywords,paper_ids,size}]
@@ -126,6 +128,8 @@ def initial_state(
         "messages": [],
         "queries": [],
         "pending_queries": [],
+        "auto_expanded_queries": [],
+        "auto_expanded": False,
         "papers": [],
         "evidence": [],
         "clusters": [],
