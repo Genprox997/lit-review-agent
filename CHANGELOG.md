@@ -4,6 +4,24 @@
 
 ---
 
+## 修复：相关性闸门高枢纽告警崩溃（真实数据回归，2026-08-21）
+
+**问题**：真实 DeepSeek 端到端回归重跑时，`ranker` 节点两次抛 `AttributeError: 'str' object has no attribute 'get'`，被方向 G' 的 `node_guard` 捕获降级（流程未崩、仍出稿），但**相关性闸门 / 全文优先级排序实际未生效**——下游直接用了未排序的原始文献池（离题论文可能混入、OA 全文未被优先）。stub 离线测试未能覆盖该分支（桩路径下 `dropped` 为空）。
+
+**根因**：`apply_relevance_gate` 的契约是返回 `(保留论文, 被剔除标题字符串列表)`；而 `ranker` 在计算 `dropped_high_hub`（被剔除但枢纽度仍高的告警）时，把 `dropped`（字符串标题）当成论文 dict 去 `p.get("hub_score")`，字符串无 `.get` 即崩。
+
+**修复**（`src/agent/nodes.py` `ranker` + `src/agent/tools.py`）：
+- 新增纯函数 `high_hub_dropped(papers, kept_ids)`：用 `kept_ids` 从原始 `papers` 反查被剔除的论文对象再按枢纽度过滤，返回 `[{title,hub}]`；`ranker` 改用它，不再对字符串标题调 `.get`。
+- `apply_relevance_gate` 的返回契约保持不变（仍是 `(论文, 标题列表)`），`test_p0.py` 既有断言不受影响。
+- `dedup_papers` 增加防御性过滤：检索/合并偶发混入非 dict 元素时跳过并告警，而非拖垮整条流水线（契合方向 G' 健壮性）。
+
+**验证**：
+- 新增 `tests/test_p0.py` 两个离线回归测试：`test_high_hub_dropped_ignores_title_strings`（直接验证反查逻辑）、`test_ranker_no_crash_when_dropped_titles_present`（monkeypatch 掉网络依赖，离线复现旧崩溃路径并断言不再抛出）。
+- 完整离线套件 **167 passed / 2 skipped / 2 deselected**（原 165 + 2 新增）。
+- 真实 DeepSeek 端到端重跑：无 `⚠ 告警` / `ranker` / `AttributeError` / `⏱ 超时`，`run_errors` 为空；成稿 29884 字、60 引用、faithfulness 1.0。
+
+---
+
 ## 方向 H'：检索式自动扩词（伪相关反馈 PRF）（2026-08-21）
 
 **目标**：在 LLM 生成检索式之外，新增**伪相关反馈（Pseudo-Relevance Feedback）自动扩词**——从首轮 Top 相关文献的标题+摘要中挖掘高区分度词/词组（如 `deformable mirror`、`holography`），自动生成补充检索式并回流检索，显著提升召回、弥补 LLM 扩词偏弱或失败的缺口。纯函数实现，**无 LLM、无 sklearn 依赖**，离线可确定性单测。

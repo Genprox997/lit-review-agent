@@ -12,6 +12,7 @@ from src.agent.tools import (
     apply_relevance_gate,
     compute_relevance,
     enrich_topn_fulltext,
+    high_hub_dropped,
     rank_papers,
 )
 from src.config import Settings, get_settings
@@ -156,3 +157,61 @@ def test_bibtex_entry_type_uses_effective_venue():
     ref = build_reference_list([paper], {"arxiv:2301.00001": 1}, mapping)
     assert "Applied Optics" in ref
     assert "arXiv preprint" not in ref
+
+
+# ---------------------------------------------------------------------------
+# 回归：相关性闸门高枢纽告警（dropped 是标题字符串，不能当 dict 用）
+# ---------------------------------------------------------------------------
+def test_high_hub_dropped_ignores_title_strings():
+    # apply_relevance_gate 返回的 dropped 是「标题字符串」列表；
+    # 计算高枢纽告警时必须从 papers 反查论文对象，不能对字符串调 .get。
+    papers = [
+        {"paper_id": "keep1", "title": "on topic deformable mirror", "hub_score": 0.9},
+        {"paper_id": "drop1", "title": "off topic but pivotal survey", "hub_score": 0.95},
+        {"paper_id": "drop2", "title": "another off topic", "hub_score": 0.2},
+    ]
+    scores = [0.6, 0.03, 0.02]  # drop1 / drop2 被闸门剔除
+    kept, dropped = apply_relevance_gate(papers, scores, threshold=0.1, min_keep=1)
+    kept_ids = {p["paper_id"] for p in kept}
+    # dropped 是字符串标题，绝不能当 dict 用
+    assert dropped == ["off topic but pivotal survey", "another off topic"]
+    # 修复后：用 kept_ids 反查，drop1(枢纽 0.95) 应被标出，drop2(0.2) 不标
+    result = high_hub_dropped(papers, kept_ids)
+    assert result == [{"title": "off topic but pivotal survey", "hub": 0.95}]
+    # 断言实现没有对字符串调 .get（旧实现会抛 AttributeError）
+
+
+def test_ranker_no_crash_when_dropped_titles_present(monkeypatch):
+    # 回归：ranker 在 dropped（标题字符串列表）非空时，曾因对字符串调 .get 抛出
+    # AttributeError: 'str' object has no attribute 'get'。这里离线复现并断言不再崩溃。
+    from src.agent import nodes as N
+    from src.agent.state import initial_state
+
+    # 全部以确定性桩替换网络/重计算依赖，保持离线
+    monkeypatch.setattr(N, "enrich_citations", lambda papers, limit=30: 0)
+    monkeypatch.setattr(N, "enrich_topn_fulltext", lambda papers, settings=None: 0)
+    monkeypatch.setattr(N, "compute_relevance", lambda papers, topic, queries: [0.6, 0.02])
+    monkeypatch.setattr(N.CG, "score_centrality", lambda papers: _assign_hub(papers))
+
+    papers = [
+        {"paper_id": "keep1", "title": "on topic deformable mirror", "matched_queries": ["dm"],
+         "referenced_works": [], "abstract": "dm"},
+        {"paper_id": "drop1", "title": "off topic but pivotal survey", "matched_queries": ["dm"],
+         "referenced_works": [], "abstract": "cats"},
+    ]
+    st = initial_state("deformable mirror adaptive optics", "")
+    st["papers"] = papers
+    st["queries"] = ["dm"]
+
+    out = N.ranker(st)  # 旧实现此处会抛 AttributeError
+
+    assert isinstance(out.get("papers"), list)
+    analysis = out.get("citation_analysis") or {}
+    dh = analysis.get("dropped_high_hub") or []
+    assert any(d["title"] == "off topic but pivotal survey" for d in dh)
+
+
+def _assign_hub(papers):
+    for p in papers:
+        p["hub_score"] = 0.95 if p["paper_id"] == "drop1" else 0.1
+        p["bridge_score"] = 0.0

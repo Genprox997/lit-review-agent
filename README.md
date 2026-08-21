@@ -524,7 +524,7 @@ lit-review-agent/
 
 ```bash
 pip install -e ".[dev]"     # 含 embed / persist，便于本地跑全量
-pytest -m "not network"     # 165 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析、检索式自动扩词 PRF）
+pytest -m "not network"     # 167 离线测试全过（端到端 stub 流程，含 HITL 续跑/改写回环、Web UI 接 HITL 反馈、faithfulness、多格式输出、引用网络分析、增量更新、引用网络可视化、质量评估仪表盘、长任务健壮性、PDF 深度结构化解析、检索式自动扩词 PRF、相关性闸门高枢纽告警回归修复）
 pytest -m network           # 联网测试，真打 arXiv / OpenAlex
 ```
 

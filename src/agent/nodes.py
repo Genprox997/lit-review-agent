@@ -24,6 +24,7 @@ from src.agent import quality as QL          # 质量评估仪表盘（方向 F'
 from src.agent.tools import (
     apply_relevance_gate,
     auto_expand_queries,
+    high_hub_dropped,
     compute_relevance,
     dedup_papers,
     enrich_topn_fulltext,
@@ -327,10 +328,10 @@ def ranker(state: AgentState) -> dict:
         "dropped_titles": dropped[:25],
     }
 
-    dropped_high_hub = [
-        {"title": p.get("title", ""), "hub": round(p.get("hub_score", 0.0), 4)}
-        for p in dropped if (p.get("hub_score") or 0.0) >= 0.6
-    ][:10]
+    # `dropped` 是 apply_relevance_gate 返回的「被剔除标题」字符串列表（无 hub_score），
+    # 需用 kept_ids 从原始 papers 反查被剔除的论文对象来算高枢纽告警，避免对字符串调 .get。
+    kept_ids = {p["paper_id"] for p in kept}
+    dropped_high_hub = high_hub_dropped(papers, kept_ids)
 
     # 排序用闸门幸存者；relevance 已对齐 kept 顺序，避免重复计算
     score_map = {p["paper_id"]: relevance[i] for i, p in enumerate(papers)}

@@ -11,7 +11,7 @@ import math
 import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -136,6 +136,10 @@ def dedup_papers(papers: Sequence[Paper]) -> List[Paper]:
         return ks
 
     for paper in papers:
+        if not isinstance(paper, dict):
+            # 防御性过滤：检索/合并偶发混入非 dict 元素时跳过而非崩掉整条流水线（方向 G'）
+            logger.warning("dedup_papers 跳过非 dict 元素：%r", paper)
+            continue
         if not paper.get("title"):
             continue
         ks = keys_of(paper)
@@ -229,6 +233,27 @@ def apply_relevance_gate(
         logger.warning("相关性闸门触发自适应保底：保留至少 %d 篇（阈值 %.2f）", min_keep, threshold)
 
     return kept, [p.get("title", "") for p in dropped]
+
+
+def high_hub_dropped(
+    papers: Sequence[Paper],
+    kept_ids: set,
+    hub_threshold: float = 0.6,
+    top_k: int = 10,
+) -> List[Dict[str, Any]]:
+    """从原始文献池反查被相关性闸门剔除、但枢纽度仍高的论文，用于运行告警。
+
+    `apply_relevance_gate` 返回的 ``dropped`` 仅是标题字符串列表（不含 ``hub_score``），
+    因此这里用 ``kept_ids`` 反查 ``papers`` 中未保留的论文对象再过滤，避免对字符串调 ``.get``
+    （真实数据下 ``dropped`` 含字符串标题，直接 ``p.get`` 会抛 ``AttributeError``）。
+    """
+    out: List[Dict[str, Any]] = []
+    for p in papers:
+        if p.get("paper_id") in kept_ids:
+            continue
+        if (p.get("hub_score") or 0.0) >= hub_threshold:
+            out.append({"title": p.get("title", ""), "hub": round(p.get("hub_score", 0.0), 4)})
+    return out[:top_k]
 
 
 def rank_papers(
